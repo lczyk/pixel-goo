@@ -1,5 +1,8 @@
-build
+bin
 build_windows
 progress_videos
 .DS_Store
-perlin_test
+/nob
+
+# generated shader headers (see embed_shader.py / nob.c)
+shaders/*.h

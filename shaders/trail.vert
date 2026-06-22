@@ -24,5 +24,4 @@ void main() {
 
     gl_Position = vec4(screenNormalisedCoordinates(position), 0.0f, 1.0f);
     gl_PointSize = kernel_radius/trail_buffer_downsampling;
-    // gl_PointSize = 10.0f;
 }

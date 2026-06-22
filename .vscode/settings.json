@@ -1,9 +1,0 @@
-{
-    "files.associations": {
-        "*.frag": "glsl",
-        "*.vert": "glsl",
-    },
-    // "C_Cpp.default.cppSt?andard": "c++11",
-    // "C_Cpp.default.conf?igurationProvider": "ms-vscode.cmake-tools",
-    // "C_Cpp.default.includePath": ["${workspaceRoot}", "./lib", "${workspaceRoot}/build/shaders"]
-}

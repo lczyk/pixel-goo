@@ -231,12 +231,12 @@ void main() {
 
     // Drift
     // new_velocity += 0.1 * vec2(1.0, 1.0);
-    new_velocity += 0.02 * (1-density) * vec2(0.0, -1.0);
+    // new_velocity += 0.02 * (1-density) * vec2(0.0, -1.0);
     // vec2 rotating_gravity = vec2(sin(epoch_counter*2*PI/300), cos(epoch_counter*2*PI/300));
     // new_velocity += (1- clamp(velocity,0.0,1.0)*density) * 0.1 * rotating_gravity;
-    if (density > 0.95) {
-        new_velocity += 0.09 * abs(random_vec2(vec2(3,2) + VertexID + epoch_counter)) * vec2(0,-1);
-    }
+    // if (density > 0.95) {
+    //     new_velocity += 0.09 * abs(random_vec2(vec2(3,2) + VertexID + epoch_counter)) * vec2(0,-1);
+    // }
 
     // Resolve drag after all other acceleration to make sure that very high drag coefficient works
     float old_velocity_magnitude = length(velocity);

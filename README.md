@@ -8,53 +8,52 @@ The idea is to make something similar to Sebastian Lague's [Ant and Slime Simula
 
 ## Instructions
 
-To build a standalone binary, follow the typical cmake build process:
+The build system is [nob](https://github.com/tsoding/nob.h), a single-header C build tool. Bootstrap it once with any C compiler, then it rebuilds itself when `nob.c` changes:
 
 ```bash
-mkdir build
-cd build
-cmake ..
-make
+cc -o nob nob.c
+./nob          # show usage (default target)
+./nob build    # compile
+./nob run      # build and run
+./nob clean    # remove the build dir
 ```
 
-and then run `./goo`.
-
+The binary lands at `./bin/goo`.
 
 ## Cross-compile on macos for windows
 
-To compile for windows on macos first [install mingw32 toolchain](https://blog.filippo.io/easy-windows-and-linux-cross-compilers-for-macos/):
+Not yet ported to nob (the old cmake + mingw flow was dropped in the move to nob, see the ToDo's). The mingw toolchain is still the way in:
 
 ```bash
-brew install FiloSottile/musl-cross/musl-cross
 brew install mingw-w64
 ```
 
-then follow a similar process, this time specifying the target as Windows and compiler as the `x86_64-w64-mingw32-` toolchain.
+`nob.c` already has a `_WIN32` link branch (`-lopengl32 -lgdi32`); what's missing is selecting the cross compiler and target platform when bootstrapping nob.
+
+## Autoformat
+
+for C:
 
 ```bash
-mkdir build-windows
-cd build-windows
-cmake \
-    -DCMAKE_SYSTEM_NAME=WindowsStore -DCMAKE_SYSTEM_VERSION=10.0 \
-    -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++ \
-    -DCMAKE_C_FLAGS="-static" -DCMAKE_CXX_FLAGS="-static" -DCMAKE_EXE_LINKER_FLAGS="-static" \
-    -DCMAKE_C_COMPILER_WORKS=1 -DCMAKE_CXX_COMPILER_WORKS=1 \
-    ..
-make
+find *.c | xargs -L1 clang-format -style="{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 0}" -i
+find *.h | xargs -L1 clang-format -style="{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 0}" -i
 ```
 
-Note that system-dependent libraries have to be statically linked (`-static`), and that we have to prevent cmake from checking  whether the compiler works (`...COMPILER_WORKS=1`) since it teh test program will also be cross-compiled and therefore not work on a mac.
+for python:
 
+```bash
+black .
+```
 
 ## ToDo's
 
-- [ ] add text rendering shader
 - [x] automagically include shader files at compile time
 - [ ] fullscreen mode is still a bit janky
 - [x] no acceleration and velocity shaders
 - [x] no velocity double buffer
 - [x] fix segfault buggs
-- [ ] ? add frame rendering
+- [ ] ? add frame rendering (the old C++ `saveFrame` was dropped in the C migration)
 - [ ] trail buffer colormap sampling
 - [ ] screen rendering shader could blend between density and trail colormap
 - [ ] ? better lerp in screen rendering shader
+- [ ] port windows cross-compile to nob

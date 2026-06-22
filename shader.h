@@ -1,28 +1,24 @@
 #ifndef SHADER_H
 #define SHADER_H
 
-#include <glad.h>
+#include <gl.h>
 
 #define INFOLOG_LEN 512
 
-class Shader {
-public:
+typedef struct Shader {
     const char* name;
-    Shader(const char* n) : name(n) {};
-
-    void create();
-    void use();
-    void compile(const GLuint shaderTypeEnum, const GLchar* shaderSource);
-    void link();
-
-    void setUniform(const GLchar* uniform_name, const int value);
-    void setUniform(const GLchar* uniform_name, const float value);
-    void setUniform(const GLchar* uniform_name, const int dim, const float value[]);
-
-    GLint getUniformLocation(const GLchar *uniform_name);
-
-private:
     GLint program;
-};
+} Shader;
+
+void shader_create(Shader* s);
+void shader_use(Shader* s);
+void shader_compile(Shader* s, const GLuint shaderTypeEnum, const GLchar* shaderSource);
+void shader_link(Shader* s);
+
+void shader_set_uniform_int(Shader* s, const GLchar* uniform_name, const int value);
+void shader_set_uniform_float(Shader* s, const GLchar* uniform_name, const float value);
+void shader_set_uniform_vec(Shader* s, const GLchar* uniform_name, const int dim, const float value[]);
+
+GLint shader_get_uniform_location(Shader* s, const GLchar* uniform_name);
 
 #endif /* SHADER_H */
