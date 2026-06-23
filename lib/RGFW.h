@@ -13947,10 +13947,11 @@ RGFW_window* RGFW_createWindowPlatform(const char* name, RGFW_windowFlags flags,
 		objc_msgSend_void_id((id)win->src.window, sel_registerName("setBackgroundColor:"),
 		NSColor_colorWithSRGB(0, 0, 0, 0));
 	} else {
-		/* Default the window background to opaque black instead of the system white, so any
-		 * uncovered region during a transition (e.g. dragging across monitors of different
-		 * dpi, before the GL drawable re-fits) flashes black -- matching the content -- not
-		 * a jarring white. */
+		/* Default the window background to opaque black instead of system white, so the
+		 * one-frame uncovered region during a backing-scale transition (dragging across
+		 * monitors of different dpi, or a live window resize) flashes black -- matching the
+		 * content -- instead of a jarring white. The lag itself is inherent to a polling GL
+		 * render loop on macOS; killing it entirely needs a CVDisplayLink / layer-backed view. */
 		objc_msgSend_void_id((id)win->src.window, sel_registerName("setBackgroundColor:"),
 		NSColor_colorWithSRGB(0, 0, 0, 1));
 	}

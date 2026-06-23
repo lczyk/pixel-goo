@@ -541,19 +541,6 @@ int main(int argc, char **argv)
     {
         if (max_iterations > 0 && epoch_counter >= max_iterations) break;
 
-        // Keep both the GL drawable and the upscale viewport synced to the window's current
-        // geometry *before* rendering this frame. Moving between monitors of different dpi
-        // (retina vs not) changes the device-px framebuffer without reliably firing a resize
-        // event, and cocoa won't auto-grow the raw GL drawable -- so refresh the drawable
-        // every frame (no-op when stable) and re-fit the viewport on change. Doing it before
-        // the render avoids the 1-frame partial/white flash on the transition.
-        RGFW_window_updateContext_OpenGL(window);
-        {
-            i32 fbw = 0, fbh = 0;
-            RGFW_window_getSizeInPixels(window, &fbw, &fbh);
-            if (fbw != window_width || fbh != window_height)
-                handle_framebuffer_resize(fbw, fbh);
-        }
 
         // Poll mouse position (--no-mouse parks it far off so the repel never triggers).
         float mouse_position[2] = {-1e9f, -1e9f};
@@ -683,6 +670,22 @@ int main(int argc, char **argv)
         // shader_set_uniform_int(&copyShader, "source_buffer", trailBuffer.current);
         // shader_set_uniform_float(&copyShader, "alpha", 1.0f);
         // buffer_update(&renderBuffer);
+
+        // Sync the GL drawable + upscale viewport to the window's CURRENT geometry, as late
+        // as possible (right before the only pass that touches the window). The window can
+        // change backing scale mid-frame when dragged across monitors of different dpi; the
+        // passes above are render-res (dpi-independent), so syncing here -- not at the top of
+        // the loop -- closes the 1-frame gap where the view grew but our blit hadn't, which
+        // showed the window background. [update] re-fits the drawable; it's a no-op when stable.
+        RGFW_window_updateContext_OpenGL(window);
+        {
+            i32 fbw = 0, fbh = 0;
+            RGFW_window_getSizeInPixels(window, &fbw, &fbh);
+            window_width = fbw;
+            window_height = fbh;
+            screenBuffer.width = window_width;
+            screenBuffer.height = window_height;
+        }
 
         // Upscale pass: nearest-sample the render target onto the window. Blending
         // is off -- the render target already holds particles composited over black,
@@ -926,9 +929,6 @@ void window_setup()
     height = (int)((float)logical_height / render_scale + 0.5f);
     mouse_scale = (logical_width > 0) ? (float)width / (float)logical_width : 1.0f;
 
-    printf("window: monitor=%d logical=%dx%d framebuffer(device px)=%dx%d render=%dx%d\n",
-           whichMonitor, logical_width, logical_height, window_width, window_height, width, height);
-
     // Quit when escape is pressed (reported through RGFW_window_shouldClose)
     RGFW_window_setExitKey(window, RGFW_keyEscape);
 
@@ -957,9 +957,6 @@ void handle_framebuffer_resize(int new_width, int new_height)
     i32 fb_width, fb_height, logical_width, logical_height;
     RGFW_window_getSizeInPixels(window, &fb_width, &fb_height);
     RGFW_window_getSize(window, &logical_width, &logical_height);
-    printf("resize: logical=%dx%d framebuffer(device px)=%dx%d render=%d x %d\n",
-           logical_width, logical_height, fb_width, fb_height,
-           (int)(logical_width / render_scale + 0.5f), (int)(logical_height / render_scale + 0.5f));
     window_width = fb_width;
     window_height = fb_height;
     width = (int)((float)logical_width / render_scale + 0.5f);
