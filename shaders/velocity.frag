@@ -15,6 +15,7 @@ uniform sampler2D trail_buffer;
 
 #ifdef MOUSE_REPELL
 uniform vec2 mouse_position;
+uniform vec2 mouse_velocity; // per-frame cursor delta (sim units); not wired into the force yet
 #endif
 
 uniform vec2 window_shape;
@@ -136,28 +137,28 @@ vec2 mouseRepell(vec2 mouse_vector, float mouse_repell_radius, float mouse_repel
 
 // Mouse interaction
 #ifdef EDGE_REPELL
-vec2 edgeRepell(vec2 position, vec2 window_shape, float edge_repell_radius, float edge_repell_coefficient) {
+vec2 edgeRepell(vec2 position, vec2 window_shape, vec2 edge_repell_radius, float edge_repell_coefficient) {
     vec2 repell = vec2(0,0);
     float edge_vector_length;
     // Left edge repell
     edge_vector_length = position.x;
-    if (edge_vector_length < edge_repell_radius) {
-        repell += vec2(-1,0) * (1-(edge_vector_length/edge_repell_radius)) * (1-(edge_vector_length/edge_repell_radius));
+    if (edge_vector_length < edge_repell_radius.x) {
+        repell += vec2(-1,0) * (1-(edge_vector_length/edge_repell_radius.x)) * (1-(edge_vector_length/edge_repell_radius.x));
     }
     // Right edge repell
     edge_vector_length = window_shape.x-position.x;
-    if (edge_vector_length < edge_repell_radius) {
-        repell += vec2(1,0) * (1-(edge_vector_length/edge_repell_radius)) * (1-(edge_vector_length/edge_repell_radius));
+    if (edge_vector_length < edge_repell_radius.x) {
+        repell += vec2(1,0) * (1-(edge_vector_length/edge_repell_radius.x)) * (1-(edge_vector_length/edge_repell_radius.x));
     }
     // Top edge repell
     edge_vector_length = position.y;
-    if (edge_vector_length < edge_repell_radius) {
-        repell += vec2(0,-1) * (1-(edge_vector_length/edge_repell_radius)) * (1-(edge_vector_length/edge_repell_radius));
+    if (edge_vector_length < edge_repell_radius.y) {
+        repell += vec2(0,-1) * (1-(edge_vector_length/edge_repell_radius.y)) * (1-(edge_vector_length/edge_repell_radius.y));
     }
     // Bottom edge repell
     // edge_vector_length = window_shape.y-position.y;
-    // if (edge_vector_length < edge_repell_radius) {
-    //     repell += vec2(0,1) * (1-(edge_vector_length/edge_repell_radius)) * (1-(edge_vector_length/edge_repell_radius));
+    // if (edge_vector_length < edge_repell_radius.y) {
+    //     repell += vec2(0,1) * (1-(edge_vector_length/edge_repell_radius.y)) * (1-(edge_vector_length/edge_repell_radius.y));
     // }
     return edge_repell_coefficient * repell;
 }
@@ -173,11 +174,26 @@ void main() {
 
     // Mouse repell
 #ifdef MOUSE_REPELL
-    const float mouse_repell_radius = 150;
-    const float mouse_repell_coefficient = 0.2;
+    const float mouse_repell_radius_min = 30;   // radius at rest (mouse always repels this much)
+    const float mouse_repell_radius_max = 75;   // radius at/above full cursor speed
+    const float mouse_repell_speed_scale = 3.0; // radius (sim units) per unit of cursor speed
+    const float mouse_repell_coefficient = 0.1;
+    const float mouse_drag_fraction = 0.1;      // drag gain at the reference cursor speed
+    const float mouse_drag_speed_ref = 30.0;    // cursor speed (sim u/frame) at which gain == fraction
+    // Scale the interaction radius with cursor speed, floored at the min: faster motion
+    // grows the radius up to the cap.
+    float mouse_speed = length(mouse_velocity);
+    float mouse_repell_radius = clamp(mouse_speed * mouse_repell_speed_scale, mouse_repell_radius_min, mouse_repell_radius_max);
     vec2 mouse_vector = mouse_position - position;
+    float mouse_dist = length(mouse_vector);
     new_velocity -= mouseRepell(mouse_vector, mouse_repell_radius, mouse_repell_coefficient);
-    bool inmouseradius = length(mouse_vector) < mouse_repell_radius;
+    bool inmouseradius = mouse_dist < mouse_repell_radius;
+    // Drag: sweep in-radius particles along the cursor's motion (squared spatial falloff,
+    // like the repel). Gain also scales with cursor speed, so the imparted velocity grows
+    // ~speed^2 -- faster flicks fling particles much harder; a still mouse imparts nothing.
+    float mouse_drag_falloff = max(0.0, 1.0 - mouse_dist / mouse_repell_radius);
+    float mouse_drag_gain = mouse_drag_fraction * mouse_speed / mouse_drag_speed_ref;
+    new_velocity += mouse_drag_gain * mouse_drag_falloff * mouse_drag_falloff * mouse_velocity;
     
     // Screen wrap of mouse repell (basically add additional 8 mouse positions)
     // new_velocity -= mouseRepell(mouse_vector + vec2(+window_shape.x,0), mouse_repell_radius, mouse_repell_coefficient);
@@ -216,8 +232,8 @@ void main() {
 #endif /* MOUSE_REPELL */
 
 #ifdef EDGE_REPELL
-    const float edge_repell_radius = 100;
-    const float edge_repell_coefficient = 0.1;
+    vec2 edge_repell_radius = 0.05 * window_shape;
+    const float edge_repell_coefficient = 0.15;
     new_velocity -= edgeRepell(position, window_shape, edge_repell_radius, edge_repell_coefficient);
 #endif /* EDGE_REPELL */
 

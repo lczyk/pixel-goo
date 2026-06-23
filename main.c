@@ -33,6 +33,7 @@ int window_width = 800;  // actual framebuffer size in device px; the upscale ta
 int window_height = 600;
 double render_scale = 2.0; // internal res = logical points / render_scale (>1 = lower res, faster); --render-scale
 float mouse_scale = 1.0f;  // logical-point -> render-resolution scale
+float dpi_scale = 1.0f;   // logical-point -> physical-pixel scale (>1 on Retina)
 // int width = 400; int height = 400;
 const char *title = "Pixel Goo";
 // runtime-tunable via cli (see parse_args); defaults below
@@ -44,6 +45,7 @@ int fps_cap = 60;       // --fps-cap: throttle the average fps to this (0 = unca
 bool no_keyfocus_steal = false; // --no-keyfocus-steal: show window w/out grabbing key focus
 bool no_border = false;         // --no-border: hide the title bar / border in windowed mode
 bool no_mouse = false;          // --no-mouse: disable the mouse repel (park the cursor far off)
+bool mouse_debug = false;       // --mouse-debug: draw green dot + trail at cursor
 char *dump_path = NULL; // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
 int rng_seed = 0;       // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
 int whichMonitor = 0;
@@ -76,6 +78,7 @@ Shader velocityShader = {.name = "velocityShader"};
 Shader copyShader = {.name = "copyShader"};
 Shader trailShader = {.name = "trailShader"};
 Shader upscaleShader = {.name = "upscaleShader"};
+Shader debugShader = {.name = "debugShader"};
 
 // Include shader source files
 #include "copy.h"
@@ -85,6 +88,7 @@ Shader upscaleShader = {.name = "upscaleShader"};
 #include "position.h"
 #include "velocity.h"
 #include "upscale.h"
+#include "debug.h"
 
 Buffer trailBuffer = {.name = "Trail Buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer positionBuffer = {.name = "Position buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
@@ -311,6 +315,36 @@ static void rebuild_sort_order(void)
         }                                                                   \
     } while (0)
 
+// dropt handler for --render-scale: optional val; bare -r enables low-res mode at 2.0.
+static dropt_error parse_render_scale(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest)
+{
+    (void)ctx; (void)opt;
+    if (arg == NULL) { *(double *)dest = 2.0; return dropt_error_none; }
+    return dropt_handle_double(ctx, opt, arg, dest);
+}
+
+// dropt handler for --cull: optional val; bare --cull enables culling at 0.8.
+static dropt_error parse_cull(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest)
+{
+    (void)ctx; (void)opt;
+    if (arg == NULL) { *(double *)dest = 0.8; return dropt_error_none; }
+    return dropt_handle_double(ctx, opt, arg, dest);
+}
+
+// dropt handler for --seed: optional val; bare --seed picks a random seed and prints it.
+static dropt_error parse_seed(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest)
+{
+    (void)ctx; (void)opt;
+    if (arg == NULL)
+    {
+        int s = (int)(time(NULL) & 0x7fffffff);
+        fprintf(stdout, "goo: seed %d\n", s);
+        *(int *)dest = s;
+        return dropt_error_none;
+    }
+    return dropt_handle_int(ctx, opt, arg, dest);
+}
+
 // dropt handler for a particle count with an optional k/m suffix (case-insensitive):
 // "10000", "10", "1k", "1.5k", "10M" all work. fractional values round to nearest int.
 static dropt_error parse_count(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest)
@@ -342,8 +376,8 @@ static void parse_args(int argc, char **argv)
     dropt_option options[] = {
         {'h', "help", "Show this help and exit.", NULL,
          dropt_handle_bool, &show_help, dropt_attr_halt},
-        {'p', "particles", "Number of particles to simulate (accepts k/m suffix, e.g. 1.5k, 10M).", "N",
-         parse_count, &P},
+
+        // display
         {'m', "monitor", "Index of the monitor to fullscreen onto.", "N",
          dropt_handle_int, &whichMonitor},
         {'\0', "windowed", "Run in a window instead of fullscreen.", NULL,
@@ -356,50 +390,63 @@ static void parse_args(int argc, char **argv)
          dropt_handle_int, &height},
         {'\0', "no-vsync", "Disable vsync (uncap the frame rate).", NULL,
          dropt_handle_bool, &no_vsync},
-        {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
-         dropt_handle_bool, &prof},
-        {'N', "iterations", "Exit after N loop iterations (0 = unlimited); for benchmarking.", "N",
-         dropt_handle_int, &max_iterations},
         {'\0', "fps-cap", "Throttle the average frame rate to N fps (0 = uncapped).", "N",
          dropt_handle_int, &fps_cap},
-        {'\0', "sort-every", "Rebuild tile-coherent draw order every N frames (0 = never).", "N",
-         dropt_handle_int, &sort_every},
-        {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
-         dropt_handle_bool, &no_focus},
-        {'\0', "no-mouse", "Disable the mouse repel interaction.", NULL,
-         dropt_handle_bool, &nomouse},
-        {'\0', "dens-sub", "Density buffer: scatter every Nth particle (higher = less overdraw).", "N",
-         dropt_handle_int, &densitySubsample},
-        {'\0', "trail-sub", "Trail buffer: scatter every Nth particle (higher = less overdraw).", "N",
-         dropt_handle_int, &trailSubsample},
-        {'\0', "dens-downsample", "Density field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
-         dropt_handle_int, &densityBufferDownsampling},
-        {'\0', "trail-downsample", "Trail field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
-         dropt_handle_int, &trailBufferDownsampling},
-        {'\0', "cull", "Screen density cull amount, 0 = off .. 1 = max (thins denser regions).", "F",
-         dropt_handle_double, &cullAmount},
+
+        // particles
+        {'p', "particles", "Number of particles to simulate (accepts k/m suffix, e.g. 1.5k, 10M).", "N",
+         parse_count, &P},
+        {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier; bare -r = 2).", "N",
+         parse_render_scale, &render_scale, dropt_attr_optional_val},
+        {'\0', "seed", "Fixed RNG seed (bare --seed = random but printed for replay; 0 = silent random).", "N",
+         parse_seed, &rng_seed, dropt_attr_optional_val},
+        {'\0', "cull", "Screen density cull, 0..1 (bare --cull = 0.8; thins denser regions).", "F",
+         parse_cull, &cullAmount, dropt_attr_optional_val},
+
+        // colormap
+        {'\0', "gamma", "Colormap curve: 1 = linear/punchy, <1 lifts faint regions.", "F",
+         dropt_handle_double, &renderGamma},
+        {'\0', "density-nearest", "Sample the density field with GL_NEAREST (chunky pixels) instead of GL_LINEAR.", NULL,
+         dropt_handle_bool, &dens_near},
         {'\0', "headroom", "Fixed colormap headroom (0 = auto-track the density max).", "F",
          dropt_handle_double, &renderHeadroom},
         {'\0', "headroom-margin", "Auto-headroom: multiplier on the tracked max (>1 darker, <1 brighter).", "F",
          dropt_handle_double, &headroomMargin},
         {'\0', "headroom-attack", "Auto-headroom: EMA speed of the max follower (0..1).", "F",
          dropt_handle_double, &headroomAttack},
-        {'\0', "gamma", "Colormap curve: 1 = linear/punchy, <1 lifts faint regions.", "F",
-         dropt_handle_double, &renderGamma},
-        {'\0', "density-nearest", "Sample the density field with GL_NEAREST (chunky pixels) instead of GL_LINEAR.", NULL,
-         dropt_handle_bool, &dens_near},
         {'\0', "headroom-pct", "Auto-headroom: track this density percentile (1 = max; <1 ignores hot-spots).", "F",
          dropt_handle_double, &headroomPct},
+
+        // density / trail
+        {'\0', "dens-sub", "Density buffer: scatter every Nth particle (higher = less overdraw).", "N",
+         dropt_handle_int, &densitySubsample},
+        {'\0', "dens-downsample", "Density field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
+         dropt_handle_int, &densityBufferDownsampling},
         {'\0', "dens-every", "Rebuild the density field every N frames (reuse between; cheaper).", "N",
          dropt_handle_int, &dens_every},
+        {'\0', "trail-sub", "Trail buffer: scatter every Nth particle (higher = less overdraw).", "N",
+         dropt_handle_int, &trailSubsample},
+        {'\0', "trail-downsample", "Trail field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
+         dropt_handle_int, &trailBufferDownsampling},
         {'\0', "trail-every", "Update the trail field every N frames (decay/deposit compensated).", "N",
          dropt_handle_int, &trail_every},
-        {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier).", "N",
-         dropt_handle_double, &render_scale},
-        {'\0', "seed", "Fixed RNG seed for reproducible runs (0 = time-based).", "N",
-         dropt_handle_int, &rng_seed},
-        {'\0', "dump", "Debug: at exit, write frame + density + trail to <prefix>_*.ppm.", "PREFIX",
+        {'\0', "sort-every", "Rebuild tile-coherent draw order every N frames (0 = never).", "N",
+         dropt_handle_int, &sort_every},
+
+        // debug
+        {'\0', "no-mouse", "Disable the mouse repel interaction.", NULL,
+         dropt_handle_bool, &nomouse},
+        {'\0', "mouse-debug", "Draw a green dot and trail at the cursor position.", NULL,
+         dropt_handle_bool, &mouse_debug},
+        {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
+         dropt_handle_bool, &prof},
+        {'N', "iterations", "Exit after N loop iterations (0 = unlimited); for benchmarking.", "N",
+         dropt_handle_int, &max_iterations},
+        {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
+         dropt_handle_bool, &no_focus},
+        {'\0', "dump", "At exit, write frame + density + trail to <prefix>_*.ppm.", "PREFIX",
          dropt_handle_string, &dump_path},
+
         {0} // sentinel
     };
 
@@ -409,6 +456,7 @@ static void parse_args(int argc, char **argv)
         fprintf(stderr, "goo: out of memory setting up option parser\n");
         exit(EXIT_FAILURE);
     }
+    dropt_allow_concatenated_arguments(ctx, true);
 
     dropt_parse(ctx, argc - 1, &argv[1]);
 
@@ -507,6 +555,7 @@ int main(int argc, char **argv)
 
     i32 xpos = 0;
     i32 ypos = 0;
+    bool mouse_in_window = RGFW_window_isMouseInside(window);
     RGFW_window_getMouse(window, &xpos, &ypos);
     float mouse_position[] = {(float)xpos * mouse_scale, (float)ypos * mouse_scale};
     shader_set_uniform_vec(&velocityShader, "mouse_position", 2, mouse_position);
@@ -545,14 +594,26 @@ int main(int argc, char **argv)
         if (max_iterations > 0 && epoch_counter >= max_iterations) break;
 
 
-        // Poll mouse position (--no-mouse parks it far off so the repel never triggers).
+        // Poll mouse position (--no-mouse parks it far off so the repel never triggers)
+        // and the per-frame velocity (delta vs last frame, same sim units as position).
+        static float prev_mouse_position[2] = {-1e9f, -1e9f};
         float mouse_position[2] = {-1e9f, -1e9f};
-        if (!no_mouse)
+        float mouse_velocity[2] = {0.0f, 0.0f};
+        if (!no_mouse && mouse_in_window)
         {
             RGFW_window_getMouse(window, &xpos, &ypos);
             mouse_position[0] = (float)xpos * mouse_scale;
             mouse_position[1] = (float)ypos * mouse_scale;
+            // velocity only if the previous frame was also in-window -- otherwise the delta
+            // is the teleport from the parked sentinel (re-entry jump), not a real motion.
+            if (prev_mouse_position[0] > -1e8f)
+            {
+                mouse_velocity[0] = mouse_position[0] - prev_mouse_position[0];
+                mouse_velocity[1] = mouse_position[1] - prev_mouse_position[1];
+            }
         }
+        prev_mouse_position[0] = mouse_position[0];
+        prev_mouse_position[1] = mouse_position[1];
 
         double _tp;
         if (profile) { glFinish(); _tp = get_time(); }
@@ -560,6 +621,7 @@ int main(int argc, char **argv)
         // Velocity pass
         shader_use(&velocityShader);
         shader_set_uniform_vec(&velocityShader, "mouse_position", 2, mouse_position);
+        shader_set_uniform_vec(&velocityShader, "mouse_velocity", 2, mouse_velocity);
         shader_set_uniform_int(&velocityShader, "position_buffer", positionBuffer.current);
         shader_set_uniform_int(&velocityShader, "velocity_buffer", velocityBuffer.current);
         shader_set_uniform_int(&velocityShader, "trail_buffer", trailBuffer.current);
@@ -699,6 +761,26 @@ int main(int argc, char **argv)
         shader_set_uniform_int(&upscaleShader, "source_buffer", renderBuffer.current);
         buffer_update(&screenBuffer);
         glEnable(GL_BLEND);
+
+        // Mouse debug overlay: green dot at cursor + line from prev to current position.
+        // Use raw logical window coords (xpos/ypos) so the overlay matches the actual cursor.
+        static float debug_prev[2] = {0.0f, 0.0f};
+        if (mouse_debug && mouse_in_window)
+        {
+            float win_shape[2] = {(float)window_width, (float)window_height};
+            float debug_cur[2] = {(float)xpos * dpi_scale, (float)ypos * dpi_scale};
+            float positions[4] = {debug_prev[0], debug_prev[1], debug_cur[0], debug_cur[1]};
+            shader_use(&debugShader);
+            shader_set_uniform_vec(&debugShader, "window_shape", 2, win_shape);
+            glUniform2fv(glGetUniformLocation(debugShader.program, "positions"), 2, positions);
+            // NOTE: GL_PROGRAM_POINT_SIZE is enabled once globally at setup and the density/
+            // trail splat passes depend on it -- don't toggle it here or those passes collapse
+            // to 1px points and the whole field jumps. gl_PointSize=8 in debug.vert still applies.
+            glDrawArrays(GL_LINES, 0, 2);   // trail from prev to current
+            glDrawArrays(GL_POINTS, 1, 1);  // dot at current (index 1)
+            debug_prev[0] = debug_cur[0];
+            debug_prev[1] = debug_cur[1];
+        }
         LAP(5);
 
         if (profile && epoch_counter % 60 == 0)
@@ -737,6 +819,14 @@ int main(int argc, char **argv)
             if (event.type == RGFW_windowResized)
             {
                 handle_framebuffer_resize(event.update.w, event.update.h);
+            }
+            else if (event.type == RGFW_mouseLeave)
+            {
+                mouse_in_window = false;
+            }
+            else if (event.type == RGFW_mouseEnter)
+            {
+                mouse_in_window = true;
             }
             // 'q' quits, same as escape (escape handled via exit key)
             else if (event.type == RGFW_keyPressed && event.key.value == RGFW_keyQ)
@@ -939,6 +1029,7 @@ void window_setup()
     width = (int)((float)logical_width / render_scale + 0.5f);
     height = (int)((float)logical_height / render_scale + 0.5f);
     mouse_scale = (logical_width > 0) ? (float)width / (float)logical_width : 1.0f;
+    dpi_scale   = (logical_width > 0) ? (float)fb_width / (float)logical_width : 1.0f;
 
     // Quit when escape is pressed (reported through RGFW_window_shouldClose)
     RGFW_window_setExitKey(window, RGFW_keyEscape);
@@ -973,6 +1064,7 @@ void handle_framebuffer_resize(int new_width, int new_height)
     width = (int)((float)logical_width / render_scale + 0.5f);
     height = (int)((float)logical_height / render_scale + 0.5f);
     mouse_scale = (logical_width > 0) ? (float)width / (float)logical_width : 1.0f;
+    dpi_scale   = (logical_width > 0) ? (float)fb_width / (float)logical_width : 1.0f;
     glViewport(0, 0, window_width, window_height);
     updateShaderWindowShape(width, height);
     buffer_reallocate(&renderBuffer, current, width, height);
@@ -1032,6 +1124,11 @@ void shader_setup()
     shader_compile(&upscaleShader, GL_VERTEX_SHADER, upscale_VertexShaderSource);
     shader_compile(&upscaleShader, GL_FRAGMENT_SHADER, upscale_FragmentShaderSource);
     shader_link(&upscaleShader);
+
+    shader_create(&debugShader);
+    shader_compile(&debugShader, GL_VERTEX_SHADER, debug_VertexShaderSource);
+    shader_compile(&debugShader, GL_FRAGMENT_SHADER, debug_FragmentShaderSource);
+    shader_link(&debugShader);
 
     updateShaderWindowShape(width, height);
 }

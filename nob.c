@@ -22,7 +22,7 @@ exec ./bin/nob "$@"
 static const char *bin_path = BIN_DIR "/goo";
 
 // Each shader has a .vert + .frag embedded into <name>.h by generate_shaders()
-static const char *shaders[] = {"copy", "density", "position", "screen", "trail", "upscale", "velocity"};
+static const char *shaders[] = {"copy", "debug", "density", "position", "screen", "trail", "upscale", "velocity"};
 
 static const char *sources[] = {
     "main.c", "shader.c", "buffer.c", "rgfw_impl.c",
