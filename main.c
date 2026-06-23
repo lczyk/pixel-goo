@@ -541,10 +541,13 @@ int main(int argc, char **argv)
     {
         if (max_iterations > 0 && epoch_counter >= max_iterations) break;
 
-        // Keep the upscale target synced to the actual device-px framebuffer. It changes
-        // when the window moves between monitors of different dpi (retina vs not), which
-        // does not reliably fire a resize event -- so poll it (cheap; reconfig only on
-        // change). Without this the viewport is stale -> black, or the bottom-left quadrant.
+        // Keep both the GL drawable and the upscale viewport synced to the window's current
+        // geometry *before* rendering this frame. Moving between monitors of different dpi
+        // (retina vs not) changes the device-px framebuffer without reliably firing a resize
+        // event, and cocoa won't auto-grow the raw GL drawable -- so refresh the drawable
+        // every frame (no-op when stable) and re-fit the viewport on change. Doing it before
+        // the render avoids the 1-frame partial/white flash on the transition.
+        RGFW_window_updateContext_OpenGL(window);
         {
             i32 fbw = 0, fbh = 0;
             RGFW_window_getSizeInPixels(window, &fbw, &fbh);
