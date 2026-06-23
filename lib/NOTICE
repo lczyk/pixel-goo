@@ -9,9 +9,9 @@ carries no separate obligations. the header inlines Khronos khrplatform.h.
 
 rgfw -- lib/RGFW.h is a single-header window + opengl context library by Riley Mabb
 (@ColleagueRiley), v2.0.0-dev, from https://github.com/ColleagueRiley/RGFW. zlib/libpng
-licensed. carries local changes for borderless fullscreen on macos (tagged
-"pixel-goo local patch" inline) -- see lib/patches/rgfw-borderless-fullscreen.patch
-for the diff against pristine upstream and the re-apply procedure.
+licensed. carries one local change (keyable macos fullscreen, tagged "pixel-goo local
+patch" inline) -- see lib/patches/rgfw-fullscreen-keyable.patch for the diff against
+pristine upstream and the re-apply procedure.
 
 cglm -- lib/cglm/ is a header-only C math library by Recep Aslantas (@recp), v0.9.6, from
 https://github.com/recp/cglm. MIT licensed -- see LICENSE-cglm.

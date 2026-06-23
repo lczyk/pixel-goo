@@ -1,39 +1,32 @@
 # local patches
 
-local changes to vendored libraries that aren't header-only drop-ins. each `.patch`
-is a unified diff against the pristine upstream file, so it survives re-vendoring.
+local changes to `lib/RGFW.h` (not a header-only drop-in). the `.patch` is a unified
+diff against pristine upstream, so it survives re-vendoring.
 
-## rgfw-borderless-fullscreen.patch
+## rgfw-fullscreen-keyable.patch
 
-four local changes to `lib/RGFW.h` (all tagged `pixel-goo local patch` inline) that
-make borderless fullscreen behave on macos:
+one change to `RGFW_window_setFullscreen` (macos), tagged `pixel-goo local patch` inline.
 
-- `canBecomeKeyWindow` / `canBecomeMainWindow` forced to `YES`, so the borderless
-  status-level fullscreen window can take key focus -- without it no `keyDown`
-  events arrive and escape-to-quit never fires.
-- drop the redundant `toggleFullScreen:` call in `RGFW_window_setFullscreen`; it
-  dropped the window into a native fullscreen Space, which re-showed the menu bar
-  and added the Space transition. the manual borderless + status-level cover is
-  enough.
-- hide the menu bar + dock via `setPresentationOptions` on enter (a status-level
-  window does not cover the menu bar on modern macos, esp. with the notch), and
-  restore them on exit.
+upstream makes the window borderless + status-level (`setBorder FALSE` / `setLevel:25`
+/ `orderFront`) right before `toggleFullScreen:`. a borderless status-level window
+can't become the key window on cocoa, so `keyDown` never arrives and escape-to-quit is
+dead in fullscreen. the native `toggleFullScreen:` already gives a proper keyable
+fullscreen Space (title bar + menu bar auto-hidden), so the prelude is dropped.
 
-generated against upstream `ColleagueRiley/RGFW` `main` (v2.0.0-dev), which matched
-the vendored copy byte-for-byte apart from these changes.
+generated against upstream `ColleagueRiley/RGFW` `main` (v2.0.0-dev), which matched the
+vendored copy byte-for-byte apart from this change. arguably an upstream bug worth a PR.
 
 ### re-applying after re-vendoring RGFW.h
 
 ```
 # from repo root, with a fresh pristine lib/RGFW.h in place
-patch -p1 < lib/patches/rgfw-borderless-fullscreen.patch
+patch -p1 < lib/patches/rgfw-fullscreen-keyable.patch
 ```
 
-if upstream has moved and the patch no longer applies cleanly, reapply the four
-changes by hand -- grep `pixel-goo local patch` in this repo's git history for the
-exact blocks -- and regenerate the patch:
+if upstream moved and it won't apply cleanly, grep `pixel-goo local patch` in this repo's
+git history for the exact hunk, reapply by hand, and regenerate:
 
 ```
 diff -u -L a/lib/RGFW.h -L b/lib/RGFW.h <pristine-RGFW.h> lib/RGFW.h \
-  > lib/patches/rgfw-borderless-fullscreen.patch
+  > lib/patches/rgfw-fullscreen-keyable.patch
 ```

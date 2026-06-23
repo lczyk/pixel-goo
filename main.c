@@ -462,8 +462,7 @@ void window_setup()
         RGFW_window_move(window, win_x, win_y);
         RGFW_window_setFullscreen(window, RGFW_TRUE);
         // setFullscreen leaves a borderless status-level window. With the
-        // canBecomeKeyWindow override in RGFW.h it can now take key focus, which
-        // is required for keyDown (escape-to-quit) to be delivered.
+        // canBecomeKeyWindow override in RGFW.h it can now take key focus.
         RGFW_window_focus(window);
     }
 

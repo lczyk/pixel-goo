@@ -1,0 +1,26 @@
+--- a/lib/RGFW.h
++++ b/lib/RGFW.h
+@@ -14114,8 +14114,6 @@
+ 		RGFW_monitor* mon = RGFW_window_getMonitor(win);
+ 		RGFW_monitor_scaleToWindow(mon, win);
+ 
+-		RGFW_window_setBorder(win, RGFW_FALSE);
+-
+ 		if (mon != NULL) {
+ 			win->x = mon->x;
+ 			win->y = mon->y;
+@@ -14125,8 +14123,12 @@
+ 			RGFW_window_move(win, mon->x, mon->y);
+ 		}
+ 
+-		((id(*)(id, SEL, SEL))objc_msgSend)((id)win->src.window, sel_registerName("orderFront:"), (SEL)NULL);
+-		objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), 25);
++		/* pixel-goo local patch: upstream makes the window borderless + status level
++		 * (setBorder FALSE / setLevel:25 / orderFront) before toggleFullScreen:. A
++		 * borderless status-level window can't become the key window on cocoa, so
++		 * keyDown never arrives and escape-to-quit is dead in fullscreen. The native
++		 * toggleFullScreen: below already gives a proper keyable fullscreen Space
++		 * (title bar + menu bar auto-hidden), so the prelude is dropped. */
+ 	}
+ 
+ 	objc_msgSend_void_SEL(win->src.window, sel_registerName("toggleFullScreen:"), NULL);

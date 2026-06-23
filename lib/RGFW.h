@@ -13132,10 +13132,6 @@ static u32 RGFW_OnClose(id self) {
 /* NOTE(EimaMei): Fixes the constant clicking when the app is running under a terminal. */
 static bool RGFW__osxAcceptsFirstResponder(void) { return true; }
 static bool RGFW__osxPerformKeyEquivalent(id event) { RGFW_UNUSED(event); return true; }
-/* pixel-goo local patch: a borderless window at status level (see
- * RGFW_window_setFullscreen) can't become the key window by cocoa default, so it
- * never receives keyDown events (escape-to-quit dies). Force keyability. */
-static bool RGFW__osxCanBecomeKeyWindow(id self, SEL sel) { RGFW_UNUSED(self); RGFW_UNUSED(sel); return true; }
 
 static NSDragOperation RGFW__osxDraggingEntered(id self, SEL sel, id sender) {
 	RGFW_UNUSED(sel);
@@ -13772,13 +13768,6 @@ i32 RGFW_initPlatform(void) {
 	class_addMethod(objc_getClass("NSWindowClass"), sel_registerName("acceptsFirstResponder:"), (IMP)(void*)RGFW__osxAcceptsFirstResponder, 0);
 	class_addMethod(objc_getClass("NSWindowClass"), sel_registerName("performKeyEquivalent:"), (IMP)(void*)RGFW__osxPerformKeyEquivalent, 0);
 
-	/* pixel-goo local patch: override NSWindow's canBecomeKeyWindow/canBecomeMainWindow
-	 * to always return YES, so the borderless status-level window used for fullscreen
-	 * can take key focus and deliver keyDown (escape-to-quit). class_replaceMethod
-	 * (not addMethod) because NSWindow already implements these. */
-	class_replaceMethod(objc_getClass("NSWindow"), sel_registerName("canBecomeKeyWindow"), (IMP)RGFW__osxCanBecomeKeyWindow, "B@:");
-	class_replaceMethod(objc_getClass("NSWindow"), sel_registerName("canBecomeMainWindow"), (IMP)RGFW__osxCanBecomeKeyWindow, "B@:");
-
 	_RGFW->NSApp = objc_msgSend_id(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
 
 	NSRetain(_RGFW->NSApp);
@@ -14125,8 +14114,6 @@ void RGFW_window_setFullscreen(RGFW_window* win, RGFW_bool fullscreen) {
 		RGFW_monitor* mon = RGFW_window_getMonitor(win);
 		RGFW_monitor_scaleToWindow(mon, win);
 
-		RGFW_window_setBorder(win, RGFW_FALSE);
-
 		if (mon != NULL) {
 			win->x = mon->x;
 			win->y = mon->y;
@@ -14136,23 +14123,15 @@ void RGFW_window_setFullscreen(RGFW_window* win, RGFW_bool fullscreen) {
 			RGFW_window_move(win, mon->x, mon->y);
 		}
 
-		((id(*)(id, SEL, SEL))objc_msgSend)((id)win->src.window, sel_registerName("orderFront:"), (SEL)NULL);
-		objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), 25);
-
-		/* pixel-goo local patch: a status-level (25) window does NOT cover the
-		 * system menu bar on modern macOS (it's special-cased, more so with the
-		 * notch). Hide it (and the dock) via the app presentation options.
-		 * NSApplicationPresentationHideMenuBar (1<<3) | HideDock (1<<1); the menu
-		 * bar option is invalid without the dock option. */
-		((void(*)(id, SEL, unsigned long))objc_msgSend)((id)_RGFW->NSApp, sel_registerName("setPresentationOptions:"), (unsigned long)((1 << 3) | (1 << 1)));
+		/* pixel-goo local patch: upstream makes the window borderless + status level
+		 * (setBorder FALSE / setLevel:25 / orderFront) before toggleFullScreen:. A
+		 * borderless status-level window can't become the key window on cocoa, so
+		 * keyDown never arrives and escape-to-quit is dead in fullscreen. The native
+		 * toggleFullScreen: below already gives a proper keyable fullscreen Space
+		 * (title bar + menu bar auto-hidden), so the prelude is dropped. */
 	}
 
-	/* pixel-goo local patch: upstream also calls toggleFullScreen: here, which
-	 * drops the window into a native fullscreen Space -- that re-shows the menu
-	 * bar (and adds the Space transition). The manual borderless + status-level
-	 * (25) cover above already gives an instant borderless fullscreen that sits
-	 * over the menu bar, so the native toggle is dropped. Enter and exit are both
-	 * handled by the manual resize/move (the !fullscreen branch below). */
+	objc_msgSend_void_SEL(win->src.window, sel_registerName("toggleFullScreen:"), NULL);
 
 	if (!fullscreen) {
 		win->x  = win->internal.oldX;
@@ -14160,10 +14139,6 @@ void RGFW_window_setFullscreen(RGFW_window* win, RGFW_bool fullscreen) {
 		win->w  = win->internal.oldW;
 		win->h = win->internal.oldH;
 		win->internal.flags &= ~(u32)RGFW_windowFullscreen;
-
-		/* pixel-goo local patch: restore the menu bar / dock (paired with the
-		 * setPresentationOptions hide above). 0 == NSApplicationPresentationDefault. */
-		((void(*)(id, SEL, unsigned long))objc_msgSend)((id)_RGFW->NSApp, sel_registerName("setPresentationOptions:"), (unsigned long)0);
 
 		RGFW_window_resize(win, win->w, win->h);
 		RGFW_window_move(win, win->x, win->y);
