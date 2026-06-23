@@ -1,9 +1,11 @@
 #version 330 core
 
 uniform vec2 window_shape;
-uniform float cull_amount; // fraction of particles culled, uniformly (--cull)
+uniform sampler2D density_buffer;
+uniform float cull_amount;    // max density-weighted cull probability (--cull)
+uniform float render_headroom; // density normalization shared with the screen colormap
 
-// Position/velocity streamed from PBOs as attributes (no vertex texture fetch).
+// Position/velocity streamed from PBOs as attributes; density is sampled for culling.
 layout(location = 0) in vec2 a_position;
 layout(location = 1) in vec2 a_velocity;
 
@@ -19,14 +21,23 @@ vec2 screenNormalisedCoords(vec2 coordinate) {
         );
 }
 
+vec2 textureNormalisedCoords(vec2 coordinate) {
+    coordinate = mod(coordinate, window_shape);
+    return vec2(coordinate.x/window_shape.x, 1.0 - coordinate.y/window_shape.y);
+}
+
 void main() {
     velocity = length(a_velocity);
 
-    // Uniform stable cull: keep iff the particle's fixed random > cull_amount. It's
-    // density-independent, so the culled set is identical every frame -> cannot flicker
-    // (unlike the old density-driven cull, which popped as the live density jittered).
-    // culled points go offscreen -> clipped before the tiler ever bins them.
-    if (random(3.0 + float(gl_VertexID)) < cull_amount) {
+    float density = texture(density_buffer, textureNormalisedCoords(a_position)).x;
+    float norm_density = clamp(density / max(render_headroom, 0.0001), 0.0, 1.0);
+    float density_cull = cull_amount * min(sqrt(norm_density), 0.65);
+
+    // Stable density cull: each particle has a fixed threshold, while local density
+    // controls the cull probability. The concave curve gives sparse edges meaningful
+    // thinning, while the cap keeps dense cores from dropping every particle.
+    // Culled points are clipped before rasterization.
+    if (random(3.0 + float(gl_VertexID)) < density_cull) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         return;
     }

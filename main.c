@@ -109,11 +109,11 @@ int trailSubsample = 2;   // --trail-sub
 int dens_every = 3;       // --dens-every: rebuild density field every N frames (reuse between)
 int trail_every = 2;      // --trail-every: deposit a rotating 1/N trail subset per frame (decay every frame)
 
-// Screen render: uniform cull (--cull), 0 = off .. 1 = all. Drops that fraction of particles
-// by a fixed per-particle random -- density-independent, so the culled set is identical every
-// frame and cannot flicker. Purely a perf/thinning knob; only thins the screen point pass, not
-// the physics. (The dense-core look is handled by the additive-density + tonemap render, not
-// by culling, so this defaults off.)
+// Screen render: density-weighted cull (--cull), 0 = off .. 1 = maximum thinning.
+// Each particle gets a fixed random threshold, but the probability is scaled by
+// capped sqrt(local density / render_headroom), so denser regions cull more
+// aggressively without blacking out hot cores. Only thins the screen point pass,
+// not the physics.
 double cullAmount = 0.0; // --cull
 
 // Screen colormap: density is additive/unbounded; the render log-maps it (a compressor),
