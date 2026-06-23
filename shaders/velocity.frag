@@ -24,6 +24,11 @@ in float VertexID;
 uniform int epoch_counter;
 uniform float drag_coefficient;
 uniform float dither_coefficient;
+uniform float density_force;  // density-gradient repel strength (was 0.04)
+uniform float trail_force;    // trail-gradient attract strength (was 0.07)
+uniform float edge_repell_coefficient; // edge repel strength (was 0.18)
+uniform float density_reach;  // density VDI sampling radius, sim px (was 20)
+uniform float trail_reach;    // trail VWI sampling radius, sim px (was 30)
 uniform sampler2D position_buffer;
 uniform sampler2D velocity_buffer;
 
@@ -210,9 +215,9 @@ void main() {
 #ifdef MOUSE_REPELL
     // if (!inmouseradius) {
 #endif /* MOUSE_REPELL */
-        vec2 density_integral = textureVDI(density_buffer, position, 20, 2, 20);
+        vec2 density_integral = textureVDI(density_buffer, position, density_reach, 2, 20);
         // new_velocity -= 0.01 * density_integral;
-        new_velocity -= 0.04 * density_integral;
+        new_velocity -= density_force * density_integral;
         // new_velocity -= (1-density) * 0.02 * density_integral;
         // new_velocity -= (1-(1-density)*(1-density)) * 0.02 * density_integral;
 #ifdef MOUSE_REPELL
@@ -223,17 +228,16 @@ void main() {
 #ifdef MOUSE_REPELL
     if (!inmouseradius) {
 #endif /* MOUSE_REPELL */
-        vec2 trail_integral = textureVWI(trail_buffer, position, velocity, PI*0.6, 30, 10, 20);
+        vec2 trail_integral = textureVWI(trail_buffer, position, velocity, PI*0.6, trail_reach, 10, 20);
         // new_velocity += 0.07 * trail_integral;
         // new_velocity += clamp(1-density,0.2,1.0) * 0.05 * trail_integral;
-        new_velocity += clamp((1-(density * density * density)), 0.8, 1) * 0.07 * trail_integral;
+        new_velocity += clamp((1-(density * density * density)), 0.8, 1) * trail_force * trail_integral;
 #ifdef MOUSE_REPELL
     }
 #endif /* MOUSE_REPELL */
 
 #ifdef EDGE_REPELL
     vec2 edge_repell_radius = 0.05 * window_shape;
-    const float edge_repell_coefficient = 0.15;
     new_velocity -= edgeRepell(position, window_shape, edge_repell_radius, edge_repell_coefficient);
 #endif /* EDGE_REPELL */
 

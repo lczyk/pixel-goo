@@ -6,5 +6,12 @@ progress_videos
 # generated shader headers (see generate_shaders in nob.c)
 shaders/*.h
 
+# generated default-config tokens (see generate_default_params in nob.c)
+default_params.h
+
 # nob build tool binary
 nob
+nob.old
+
+# rendered output (--headless)
+*.mp4

@@ -4,7 +4,8 @@ out vec4 color;
 layout(pixel_center_integer) in vec4 gl_FragCoord;
 
 uniform sampler2D density_buffer;
-uniform vec2 window_shape;
+uniform vec2 window_shape;  // sim space (shared with screen.vert); unused in this stage
+uniform vec2 render_shape;  // render-buffer resolution, for the gl_FragCoord -> uv mapping
 
 // Density is additive/unbounded. The colormap normalises by render_headroom (auto-tracked
 // to the live density max -> the brightest region lands just under 1.0, no clipping) then
@@ -79,7 +80,7 @@ const vec4 color2 = vec4(0.925f, 0.69f, 0.208f, 0.8f);
 
 void main() {
     vec2 position = gl_FragCoord.xy;
-    float density = texture(density_buffer, position/window_shape).x;
+    float density = texture(density_buffer, position/render_shape).x;
 
     // NOTE: the stochastic density cull now happens in the vertex shader (pre-binning),
     // so no discard here -- only points that survived the cull ever reach this stage.
