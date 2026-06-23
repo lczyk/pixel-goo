@@ -20,6 +20,9 @@ cc -o nob nob.c
 
 The binary lands at `./bin/goo`.
 
+By default, windowed mode uses a bordered window. Pass `--no-border` if you want
+the old borderless look.
+
 ## Cross-compile on macos for windows
 
 Not yet ported to nob (the old cmake + mingw flow was dropped in the move to nob, see the ToDo's). The mingw toolchain is still the way in:

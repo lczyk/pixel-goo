@@ -125,6 +125,33 @@ two practical exploits:
 - when amortising or subsampling a field, **compensate the magnitude** (alpha/intensity/decay) so the
   steady-state the physics sees is unchanged, not just the per-frame deposit.
 
+## multi-monitor / retina windowing (gl drawable, not perf)
+
+a window on -- or dragged to -- a monitor of a different backing scale (retina 2x vs non-retina
+1x) rendered black or into a sub-quadrant. two distinct causes, both confirmed by apple's docs:
+
+- **the GL drawable does not auto-refit.** a raw `NSOpenGLContext` keeps its old surface when the
+  window moves to a screen of a different `contentsScale` unless you call `[context update]`. apple:
+  update "updates the attached drawable objects ... ensures the renderer is properly updated for any
+  virtual screen changes. if you don't update the rendering context, you may see rendering artifacts."
+  fix here: a small `RGFW_window_updateContext_OpenGL` ([ctx update]) called before the upscale, plus
+  re-querying the device-px framebuffer to re-fit the viewport.
+- **the residual 1-frame flash is inherent to a polling render loop.** `getSizeInPixels`/the backing
+  scale lag cocoa's actual display switch by one frame, so the transition frame is presented at the
+  old size before any API reports the new one. the *correct* zero-lag fix is event-driven, not polled:
+  handle `viewDidChangeBackingProperties` / `NSApplicationDidChangeScreenParametersNotification`, or
+  drive rendering from a `CVDisplayLink` / layer-backed `NSOpenGLLayer` (which also fixes live-resize
+  flicker -- the same root cause). that's an architecture change; we mitigated instead by setting the
+  window background opaque black so the gap blinks black (invisible vs the content) not white.
+- nb: `wantsBestResolutionOpenGLSurface` defaults to NO (1px-per-point regardless of backing scale) --
+  relevant if you ever want the gl surface itself at native retina res.
+
+sources:
+- [Working with Rendering Contexts (apple, the `update` semantics)](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/OpenGL-MacProgGuide/opengl_contexts/opengl_contexts.html)
+- [Optimizing OpenGL for High Resolution (apple, backing scale / `viewDidChangeBackingProperties`)](https://developer.apple.com/library/archive/documentation/GraphicsImaging/Conceptual/OpenGL-MacProgGuide/EnablingOpenGLforHighResolution/EnablingOpenGLforHighResolution.html)
+- [Advanced NSView setup with OpenGL/Metal on macOS (layer-backed view fix)](https://metashapes.com/blog/advanced-nsview-setup-opengl-metal-macos/)
+- [OpenGL flickering on window resize (macrumors thread)](https://forums.macrumors.com/threads/opengl-flickering-on-window-resizing.1537562/)
+
 ## the floor: per-particle cost scales with N
 
 after the structural wins, the remaining cost is just "do per-particle work for N particles" across the

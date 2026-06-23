@@ -42,6 +42,7 @@ bool profile = false; // --profile: glFinish per pass + print ms (disables pipel
 int max_iterations = 0; // -N: exit after N loop iterations (0 = unlimited); for benchmarking
 int fps_cap = 60;       // --fps-cap: throttle the average fps to this (0 = uncapped)
 bool no_keyfocus_steal = false; // --no-keyfocus-steal: show window w/out grabbing key focus
+bool no_border = false;         // --no-border: hide the title bar / border in windowed mode
 bool no_mouse = false;          // --no-mouse: disable the mouse repel (park the cursor far off)
 char *dump_path = NULL; // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
 int rng_seed = 0;       // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
@@ -347,6 +348,8 @@ static void parse_args(int argc, char **argv)
          dropt_handle_int, &whichMonitor},
         {'\0', "windowed", "Run in a window instead of fullscreen.", NULL,
          dropt_handle_bool, &windowed},
+        {'\0', "no-border", "Hide the window border/title bar.", NULL,
+         dropt_handle_bool, &no_border},
         {'\0', "width", "Window width in pixels (windowed mode).", "N",
          dropt_handle_int, &width},
         {'\0', "height", "Window height in pixels (windowed mode).", "N",
@@ -735,6 +738,11 @@ int main(int argc, char **argv)
             {
                 handle_framebuffer_resize(event.update.w, event.update.h);
             }
+            // 'q' quits, same as escape (escape handled via exit key)
+            else if (event.type == RGFW_keyPressed && event.key.value == RGFW_keyQ)
+            {
+                RGFW_window_setShouldClose(window, RGFW_TRUE);
+            }
         }
 
         // --fps-cap: nudge a per-frame sleep so the EMA frame time settles at the
@@ -822,6 +830,9 @@ void window_setup()
     // borderless window in the *current* Space instead of native fullscreen, which
     // would open a new Space and yank focus. Born borderless so no resize dance.
     if (fullscreen && no_keyfocus_steal) flags |= RGFW_windowNoBorder;
+    // Windowed mode defaults to a normal bordered window. --no-border removes
+    // the title bar / border when the user explicitly wants that look.
+    if (!fullscreen && no_border) flags |= RGFW_windowNoBorder;
 
     // Window spawn position. In fullscreen we place the window at the target
     // monitor's origin so RGFW_window_setFullscreen (which fullscreens onto
