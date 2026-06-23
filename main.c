@@ -31,7 +31,7 @@ int width = 800;
 int height = 600;
 int window_width = 800;  // actual framebuffer size in device px; the upscale target
 int window_height = 600;
-double render_scale = 1.0; // internal res = logical points / render_scale (>1 = lower res, faster); --render-scale
+double render_scale = 2.0; // internal res = logical points / render_scale (>1 = lower res, faster); --render-scale
 float mouse_scale = 1.0f;  // logical-point -> render-resolution scale
 // int width = 400; int height = 400;
 const char *title = "Pixel Goo";
@@ -114,7 +114,7 @@ int trail_every = 2;      // --trail-every: deposit a rotating 1/N trail subset 
 // capped sqrt(local density / render_headroom), so denser regions cull more
 // aggressively without blacking out hot cores. Only thins the screen point pass,
 // not the physics.
-double cullAmount = 0.0; // --cull
+double cullAmount = 0.8; // --cull
 
 // Screen colormap: density is additive/unbounded; the render log-maps it (a compressor),
 // and the headroom is the makeup gain. By default it AUTO-tracks the live density max with
@@ -156,9 +156,9 @@ int trail_height = 0;
 // const int P = 16384; // <- render buffer max
 // const int P = 30000;
 // const int P = 160000;
-// const int P = 200000;
 // const int P = 300000;
-int P = 500000; // --particles
+// const int P = 500000;
+int P = 200000; // --particles
 // const int P = 1000000; // emmmmm...
 
 void window_setup();
