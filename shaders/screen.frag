@@ -3,9 +3,6 @@ out vec4 color;
 
 layout(pixel_center_integer) in vec4 gl_FragCoord;
 
-uniform int epoch_counter;
-in float VertexID;
-
 uniform sampler2D density_buffer;
 uniform vec2 window_shape;
 
@@ -67,9 +64,6 @@ vec3 inferno(float t) {
 
 }
 
-float random (float seed) { // Random from 0 to 1
-    return fract(sin(seed * 0.890) * 43758.5453123);
-}
 
 const vec4 color1 = vec4(0.067f, 0.455f, 0.729f, 1.0f);
 // const vec4 color2 = vec4(0.843f, 0.329f, 0.149f, 1.0f);
@@ -79,13 +73,8 @@ void main() {
     vec2 position = gl_FragCoord.xy;
     float density = texture(density_buffer, position/window_shape).x;
 
-    // Discard high density points
-    float norm_density = density*0.80;
-    // float norm_density = density*clamp(velocity,0.0,1.0)*0.8;
-    norm_density = norm_density * norm_density;
-    if (norm_density > random(3 + VertexID + epoch_counter)) {
-        discard;
-    }
+    // NOTE: the stochastic density cull now happens in the vertex shader (pre-binning),
+    // so no discard here -- only points that survived the cull ever reach this stage.
 
     float alpha = clamp(velocity,0.0,1.0);
     // float colormap_sampler = 0.5*density+0.5;

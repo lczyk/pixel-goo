@@ -1,14 +1,14 @@
 #version 330 core
 
 uniform vec2 window_shape;
-uniform vec2 buffer_size;
-uniform sampler2D position_buffer;
 uniform int density_buffer_downsampling;
 uniform float kernel_radius;
 
+// Position streamed from a PBO as an attribute (no vertex texture fetch).
+layout(location = 0) in vec2 a_position;
+
 void main() {
-    ivec2 buffer_position = ivec2(gl_VertexID % int(buffer_size.x), gl_VertexID / int(buffer_size.y));
-    vec2 position = vec2(texelFetch(position_buffer, buffer_position, 0));
+    vec2 position = a_position;
     vec2 normalised_coordinates = vec2(
         position.x/(window_shape.x/2)-1,
         -(position.y/(window_shape.y/2)-1)

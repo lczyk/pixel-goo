@@ -17,12 +17,9 @@ void main() {
     if (dot(circCoord, circCoord) > 1.0) { discard; }
 
     float velocity_magnitude = length(velocity);
-
-    vec2 velocity_normal = velocity / velocity_magnitude;
-    // if (velocity_magnitude == 0) {discard;}
     if (velocity_magnitude < velocity_floor) {discard;}
 
-    float r = circCoord.x*circCoord.x + circCoord.y*circCoord.y;
+    vec2 velocity_normal = velocity / velocity_magnitude;
     float theta = dot(circCoord.xy,velocity_normal)/length(circCoord);
     if (theta > -COSPID16) {discard;}
 

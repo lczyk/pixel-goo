@@ -1,6 +1,6 @@
 --- a/lib/RGFW.h
 +++ b/lib/RGFW.h
-@@ -14114,8 +14114,6 @@
+@@ -14114,8 +14153,6 @@
  		RGFW_monitor* mon = RGFW_window_getMonitor(win);
  		RGFW_monitor_scaleToWindow(mon, win);
  
@@ -9,7 +9,7 @@
  		if (mon != NULL) {
  			win->x = mon->x;
  			win->y = mon->y;
-@@ -14125,8 +14123,12 @@
+@@ -14125,8 +14162,12 @@
  			RGFW_window_move(win, mon->x, mon->y);
  		}
  

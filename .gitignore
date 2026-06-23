@@ -2,7 +2,9 @@ bin
 build_windows
 progress_videos
 .DS_Store
-/nob
 
-# generated shader headers (see embed_shader.py / nob.c)
+# generated shader headers (see generate_shaders in nob.c)
 shaders/*.h
+
+# nob build tool binary
+nob

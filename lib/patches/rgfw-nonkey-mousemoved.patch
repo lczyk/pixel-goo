@@ -1,0 +1,15 @@
+--- a/lib/RGFW.h
++++ b/lib/RGFW.h
+@@ -13850,7 +13880,11 @@
+ 		trackingArea,
+ 		sel_registerName("initWithRect:options:owner:userInfo:"),
+ 		contentRect,
+-		NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect,
++		/* pixel-goo local patch: + NSTrackingMouseMoved so the view gets continuous
++		 * mouseMoved via the tracking area even when the window isn't key. Without it,
++		 * a non-key window (same-space --no-keyfocus-steal cover) only sees enter/exit
++		 * and the cursor position stales until clicked into focus. */
++		NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect,
+ 		(id)win->src.view,
+ 		nil
+ 	);

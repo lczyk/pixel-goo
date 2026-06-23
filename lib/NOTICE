@@ -20,5 +20,7 @@ nob -- lib/nob.h is a single-header C build system by Alexey Kutepov (@rexim / t
 v3.8.2, from https://github.com/tsoding/nob.h. dual-licensed MIT / public domain (the
 Unlicense); used here under the public domain option.
 
-dropt -- lib/dropt/ is a small command-line option parser by James D. Lin (@jamesderlin),
-v2.0.0, from https://github.com/jamesderlin/dropt. zlib-licensed.
+dropt -- lib/dropt.h is a small command-line option parser by James D. Lin (@jamesderlin),
+v2.0.0, from https://github.com/jamesderlin/dropt. zlib-licensed. the upstream multi-file library
+(dropt.h, dropt.c, ...) has been merged into this single header, stb-style. marked as altered
+inline per the zlib licence; no functional changes to the library logic.

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <time.h>
 
+#define DROPT_IMPLEMENTATION // header-only dropt: this is the single TU that emits the impl
 #include <dropt.h> // cli option parser (lib/dropt/)
 
 #define GLAD_GL_IMPLEMENTATION // header-only glad: this is the single TU that emits the impl
@@ -37,6 +38,9 @@ const char *title = "Pixel Goo";
 // runtime-tunable via cli (see parse_args); defaults below
 bool fullscreen = true;
 bool vsync = true;
+bool profile = false; // --profile: glFinish per pass + print ms (disables pipelining)
+int max_iterations = 0; // -N: exit after N loop iterations (0 = unlimited); for benchmarking
+bool no_keyfocus_steal = false; // --no-keyfocus-steal: show window w/out grabbing key focus
 int whichMonitor = 0;
 // int whichMonitor = 1;
 
@@ -53,6 +57,13 @@ const PBindex trailBufferIndex2 = 6;
 const PBindex renderBufferIndex = 7; // internal colour target, upscaled to the window
 
 GLuint vertex_buffer;
+
+// Physics buffer dims (square-ish texture holding P particles), set in buffer_setup.
+int PB_width = 0;
+int PB_height = 0;
+// PBOs for the texture->VBO readback experiment (position/velocity as attributes).
+GLuint pbo_pos = 0;
+GLuint pbo_vel = 0;
 
 Shader screenShader = {.name = "screenShader"};
 Shader densityShader = {.name = "densityShader"};
@@ -84,6 +95,23 @@ Buffer renderBuffer = {.name = "Render buffer", .textures = textures, .framebuff
 const float densityAlpha = 0.005f;
 // const float densityAlpha = 0.9f;
 const float kernelRadius = 30.0f;
+
+// The density/trail buffers are heavily downsampled, lerped physics fields -- not
+// the rendered image. Scattering every Nth particle into them (with the per-point
+// alpha scaled up to compensate) cuts the overdraw/ROP cost without a visible
+// change, since the final screen pass still draws all P points. 1 = no subsample.
+int densitySubsample = 4; // --dens-sub
+int trailSubsample = 2;   // --trail-sub
+int dens_every = 3;       // --dens-every: rebuild density field every N frames (reuse between)
+int trail_every = 2;      // --trail-every: deposit a rotating 1/N trail subset per frame (decay every frame)
+
+// Screen render: stochastic density cull amount (--cull), 0 = off, 1 = max. Higher thins
+// more of the denser regions. Drives the shader's cull ramp: thinning starts at density
+// (1 - cull) and rises to CULL_CEIL at full density, compared against a fixed-per-particle
+// random (stable -> no flicker). The ceiling stays < 1 so dense cores keep some points
+// (no holes). Purely visual -- only thins the screen point pass, not the physics.
+double cullAmount = 0.35; // --cull
+#define CULL_CEIL 0.90f   // max cull fraction at peak density (keeps cores populated)
 
 // This can be quite a lot because the density buffer is lerped and particles dither
 // const int densityBufferDownsampling = 10;
@@ -136,6 +164,90 @@ static float frand01()
     return (float)rand() / (float)RAND_MAX;
 }
 
+// Exponential moving average; seeds on first sample (prev == 0).
+static double ema(double prev, double sample, double a)
+{
+    return prev == 0.0 ? sample : a * sample + (1.0 - a) * prev;
+}
+
+// Tile-coherent draw order. The screen pass binds the goo's scattered points into
+// random TBDR tiles, which is the bottleneck; drawing them in screen-tile order via
+// an index buffer fixes it. The order is rebuilt by an O(P) counting sort over the
+// positions read back into pbo_pos (mapped on the CPU). sort_every controls cadence.
+GLuint ibo = 0;
+unsigned int *sort_idx = NULL; // P entries: particle indices in tile order
+int *sort_key = NULL;          // P entries: per-particle tile bucket (scratch)
+int *sort_counts = NULL;       // (nbuckets+1) histogram / prefix-sum scratch
+const int sort_tile = 32;      // screen tile size in px (~AGX tile granularity)
+int sort_every = 8;            // rebuild the order every N frames (1 = every frame)
+
+// Counting-sort the P particle indices by screen tile, using the positions currently
+// in pbo_pos. Uploads the result into ibo. O(P), two linear passes. Out-of-bounds
+// positions are clamped (only affects coherence, never correctness).
+static void rebuild_sort_order(void)
+{
+    int tilesW = (width + sort_tile - 1) / sort_tile;
+    int tilesH = (height + sort_tile - 1) / sort_tile;
+    int nb = tilesW * tilesH;
+    float inv_tile = 1.0f / (float)sort_tile;
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
+    float *pos = (float *)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+    if (!pos)
+    {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        return;
+    }
+
+    for (int i = 0; i <= nb; i++) sort_counts[i] = 0;
+    for (int i = 0; i < P; i++)
+    {
+        int tx = (int)(pos[2 * i] * inv_tile);
+        int ty = (int)(pos[2 * i + 1] * inv_tile);
+        tx = tx < 0 ? 0 : (tx >= tilesW ? tilesW - 1 : tx);
+        ty = ty < 0 ? 0 : (ty >= tilesH ? tilesH - 1 : ty);
+        int b = ty * tilesW + tx;
+        sort_key[i] = b;
+        sort_counts[b + 1]++;
+    }
+    for (int i = 0; i < nb; i++) sort_counts[i + 1] += sort_counts[i];
+    for (int i = 0; i < P; i++) sort_idx[sort_counts[sort_key[i]]++] = (unsigned int)i;
+
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (size_t)P * sizeof(unsigned int), sort_idx, GL_DYNAMIC_DRAW);
+}
+
+// Per-pass GPU timing. LAP(i) drains the pipe (glFinish) and folds the elapsed
+// ms since the previous lap into pass_ms[i]. Needs _tp, pass_ms, profile in scope.
+#define LAP(i)                                                              \
+    do {                                                                    \
+        if (profile) {                                                      \
+            glFinish();                                                     \
+            double _tn = get_time();                                        \
+            pass_ms[i] = ema(pass_ms[i], (_tn - _tp) * 1000.0, 0.1);        \
+            _tp = _tn;                                                      \
+        }                                                                   \
+    } while (0)
+
+// dropt handler for a particle count with an optional k/m suffix (case-insensitive):
+// "10000", "10", "1k", "1.5k", "10M" all work. fractional values round to nearest int.
+static dropt_error parse_count(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest)
+{
+    (void)ctx; (void)opt;
+    if (arg == NULL || arg[0] == '\0') return dropt_error_insufficient_arguments;
+    char *end;
+    double v = strtod(arg, &end);
+    if (end == arg) return dropt_error_mismatch;
+    if (*end == 'k' || *end == 'K') { v *= 1e3; end++; }
+    else if (*end == 'm' || *end == 'M') { v *= 1e6; end++; }
+    if (*end != '\0') return dropt_error_mismatch; // trailing junk
+    *(int *)dest = (int)(v + 0.5);
+    return dropt_error_none;
+}
+
 // Parse command-line options into the runtime globals above. Exits the process
 // on --help or on a bad option; returns normally to let the sim start.
 static void parse_args(int argc, char **argv)
@@ -143,12 +255,14 @@ static void parse_args(int argc, char **argv)
     dropt_bool show_help = 0;
     dropt_bool windowed = 0;
     dropt_bool no_vsync = 0;
+    dropt_bool prof = 0;
+    dropt_bool no_focus = 0;
 
     dropt_option options[] = {
         {'h', "help", "Show this help and exit.", NULL,
          dropt_handle_bool, &show_help, dropt_attr_halt},
-        {'p', "particles", "Number of particles to simulate.", "N",
-         dropt_handle_int, &P},
+        {'p', "particles", "Number of particles to simulate (accepts k/m suffix, e.g. 1.5k, 10M).", "N",
+         parse_count, &P},
         {'m', "monitor", "Index of the monitor to fullscreen onto.", "N",
          dropt_handle_int, &whichMonitor},
         {'\0', "windowed", "Run in a window instead of fullscreen.", NULL,
@@ -159,6 +273,24 @@ static void parse_args(int argc, char **argv)
          dropt_handle_int, &height},
         {'\0', "no-vsync", "Disable vsync (uncap the frame rate).", NULL,
          dropt_handle_bool, &no_vsync},
+        {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
+         dropt_handle_bool, &prof},
+        {'N', "iterations", "Exit after N loop iterations (0 = unlimited); for benchmarking.", "N",
+         dropt_handle_int, &max_iterations},
+        {'\0', "sort-every", "Rebuild tile-coherent draw order every N frames (0 = never).", "N",
+         dropt_handle_int, &sort_every},
+        {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
+         dropt_handle_bool, &no_focus},
+        {'\0', "dens-sub", "Density buffer: scatter every Nth particle (higher = less overdraw).", "N",
+         dropt_handle_int, &densitySubsample},
+        {'\0', "trail-sub", "Trail buffer: scatter every Nth particle (higher = less overdraw).", "N",
+         dropt_handle_int, &trailSubsample},
+        {'\0', "cull", "Screen density cull amount, 0 = off .. 1 = max (thins denser regions).", "F",
+         dropt_handle_double, &cullAmount},
+        {'\0', "dens-every", "Rebuild the density field every N frames (reuse between; cheaper).", "N",
+         dropt_handle_int, &dens_every},
+        {'\0', "trail-every", "Update the trail field every N frames (decay/deposit compensated).", "N",
+         dropt_handle_int, &trail_every},
         {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier).", "N",
          dropt_handle_double, &render_scale},
         {0} // sentinel
@@ -193,6 +325,8 @@ static void parse_args(int argc, char **argv)
     // Apply the negating switches onto the defaults.
     if (windowed) fullscreen = false;
     if (no_vsync) vsync = false;
+    if (prof) profile = true;
+    if (no_focus) no_keyfocus_steal = true;
 
     // Guard against values that would crash or hang the sim.
     if (P < 1)
@@ -232,15 +366,23 @@ int main(int argc, char **argv)
 
     // Write uniforms to shaders
     shader_set_uniform_int(&screenShader, "density_buffer", densityBuffer.current);
+    // Single --cull knob -> shader ramp: thinning starts at density (1 - cull), capped.
+    shader_set_uniform_float(&screenShader, "cull_from", (float)(1.0 - cullAmount));
+    shader_set_uniform_float(&screenShader, "cull_max", CULL_CEIL);
     shader_set_uniform_int(&densityShader, "density_buffer_downsampling", densityBufferDownsampling);
-    shader_set_uniform_float(&densityShader, "density_alpha", densityAlpha);
+    shader_set_uniform_float(&densityShader, "density_alpha", densityAlpha * densitySubsample);
     shader_set_uniform_float(&densityShader, "kernel_radius", kernelRadius);
     shader_set_uniform_float(&velocityShader, "drag_coefficient", dragCoefficient);
     shader_set_uniform_float(&velocityShader, "dither_coefficient", ditherCoefficient);
     shader_set_uniform_int(&velocityShader, "density_buffer", densityBuffer.current);
+    // Trail spread-deposit (--trail-every N): the trail decays EVERY frame (smooth fade,
+    // no frozen-field discontinuity), but each frame deposits only a rotating 1/N subset
+    // of the trail particles. With the per-point intensity scaled by N, the per-frame
+    // deposit total -- and so the field the physics sees -- is unchanged, while the
+    // expensive point scatter drops ~N x. Decay alpha stays per-frame (no compounding).
     shader_set_uniform_float(&copyShader, "alpha", trailAlpha);
     shader_set_uniform_int(&trailShader, "trail_buffer_downsampling", trailBufferDownsampling);
-    shader_set_uniform_float(&trailShader, "trail_intensity", trailIntensity);
+    shader_set_uniform_float(&trailShader, "trail_intensity", trailIntensity * trailSubsample * trail_every);
     shader_set_uniform_float(&trailShader, "velocity_floor", trailVelocityFloor);
     shader_set_uniform_float(&trailShader, "kernel_radius", trailRadius);
 
@@ -259,6 +401,15 @@ int main(int argc, char **argv)
     float exp_average_flip_time = 0.0f;
     float alpha_flip_time = 0.1;
 
+    // Per-pass GPU timing (only populated under --profile); see LAP macro.
+    double pass_ms[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const char *pass_name[8] = {"vel", "pos", "dens", "trail", "scr", "up", "rdbk", "sort"};
+
+    // True pipelined frame time (no glFinish); printed every 60 frames when not
+    // profiling, so --no-vsync shows real fps without the serialisation penalty.
+    double frame_prev = get_time();
+    double frame_ms = 0.0;
+
     //======================================
     //
     //  ##       #####    #####   #####
@@ -271,10 +422,14 @@ int main(int argc, char **argv)
 
     while (!RGFW_window_shouldClose(window))
     {
+        if (max_iterations > 0 && epoch_counter >= max_iterations) break;
 
         // Poll mouse position
         RGFW_window_getMouse(window, &xpos, &ypos);
         float mouse_position[] = {(float)xpos * mouse_scale, (float)ypos * mouse_scale};
+
+        double _tp;
+        if (profile) { glFinish(); _tp = get_time(); }
 
         // Velocity pass
         shader_use(&velocityShader);
@@ -286,6 +441,7 @@ int main(int argc, char **argv)
         buffer_bind(&velocityBuffer, other);
         buffer_update(&velocityBuffer);
         buffer_flip(&velocityBuffer);
+        LAP(0);
 
         // Position pass
         shader_use(&positionShader);
@@ -296,36 +452,68 @@ int main(int argc, char **argv)
         // buffer_update(&positionBuffer);
         buffer_update(&positionBuffer);
         buffer_flip(&positionBuffer);
+        LAP(1);
 
-        // Density buffer pass
-        shader_use(&densityShader);
-        shader_set_uniform_int(&densityShader, "position_buffer", positionBuffer.current);
-        shader_set_uniform_int(&densityShader, "density_buffer_downsampling", densityBufferDownsampling);
-        buffer_bind(&densityBuffer, current);
-        buffer_update_n(&densityBuffer, P);
+        // READBACK PROBE: copy the fresh position + velocity textures into PBOs
+        // (GL_PIXEL_PACK_BUFFER). Measures whether glReadPixels FBO->PBO stays on
+        // the GPU or stalls. Not yet wired to any attribute -- pure cost measurement.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, positionBuffer.framebuffers[positionBuffer.current]);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
+        glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, velocityBuffer.framebuffers[velocityBuffer.current]);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_vel);
+        glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, 0);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        LAP(6);
 
-        // Trail buffer
+        // Rebuild the tile-coherent draw order from the freshly read-back positions.
+        if (sort_every > 0 && epoch_counter % sort_every == 0)
+        {
+            double s0 = get_time();
+            rebuild_sort_order();
+            pass_ms[7] = ema(pass_ms[7], (get_time() - s0) * 1000.0, 0.1);
+        }
+
+        // Density buffer pass. Amortised: the density field is a slow-moving snapshot,
+        // and the buffer isn't flipped, so on skipped frames it just keeps the last
+        // rebuild (1..N-1 frame stale -- negligible to the velocity integral that reads
+        // it). buffer_bind clears, so skip the whole block (not just the draw).
+        if (dens_every <= 1 || epoch_counter % dens_every == 0)
+        {
+            shader_use(&densityShader);
+            shader_set_uniform_int(&densityShader, "density_buffer_downsampling", densityBufferDownsampling);
+            buffer_bind(&densityBuffer, current);
+            buffer_update_n(&densityBuffer, P / densitySubsample);
+        }
+        LAP(2);
+
+        // Trail buffer. Decay every frame (smooth), but deposit only a rotating 1/N
+        // subset of the trail particles (--trail-every N), cycling the contiguous block
+        // by frame. Particle ids aren't spatially sorted, so each block is a fair random
+        // subset; over N frames all contribute. No frozen field -> no discontinuity.
         buffer_bind(&trailBuffer, other);
 
-        shader_use(&copyShader); // First pass (alpha blend of the double buffer)
+        shader_use(&copyShader); // First pass (decay the previous trail, every frame)
         shader_set_uniform_float(&copyShader, "alpha", trailAlpha);
         shader_set_uniform_int(&copyShader, "source_buffer", trailBuffer.current);
         buffer_update(&trailBuffer);
 
-        shader_use(&trailShader); // Second pass
-        shader_set_uniform_int(&trailShader, "position_buffer", positionBuffer.current);
-        shader_set_uniform_int(&trailShader, "velocity_buffer", velocityBuffer.current);
-        buffer_update_n(&trailBuffer, P);
+        shader_use(&trailShader); // Second pass (deposit this frame's rotating subset)
+        int trail_total = P / trailSubsample;
+        int trail_block = trail_every <= 1 ? trail_total : trail_total / trail_every;
+        int trail_start = trail_every <= 1 ? 0 : (epoch_counter % trail_every) * trail_block;
+        glDrawArrays(GL_POINTS, trail_start, trail_block);
         buffer_flip(&trailBuffer);
+        LAP(3);
 
         // Screen rendering pass -> internal render target (render resolution)
         buffer_bind(&renderBuffer, current);
 
         shader_use(&screenShader);
-        shader_set_uniform_int(&screenShader, "position_buffer", positionBuffer.current);
-        shader_set_uniform_int(&screenShader, "velocity_buffer", velocityBuffer.current);
-        shader_set_uniform_int(&screenShader, "epoch_counter", epoch_counter);
-        buffer_update_n(&renderBuffer, P);
+        // Draw in tile-coherent order via the index buffer (ibo stays bound in the VAO).
+        glDrawElements(GL_POINTS, P, GL_UNSIGNED_INT, 0);
+        LAP(4);
 
         // View density buffer
         // shader_use(&copyShader);
@@ -348,6 +536,27 @@ int main(int argc, char **argv)
         shader_set_uniform_int(&upscaleShader, "source_buffer", renderBuffer.current);
         buffer_update(&screenBuffer);
         glEnable(GL_BLEND);
+        LAP(5);
+
+        if (profile && epoch_counter % 60 == 0)
+        {
+            double tot = 0;
+            fprintf(stdout, "ms:");
+            for (int i = 0; i < 8; i++)
+            {
+                fprintf(stdout, " %s=%.2f", pass_name[i], pass_ms[i]);
+                tot += pass_ms[i];
+            }
+            fprintf(stdout, " | total=%.2f (%.0f fps)\n", tot, tot > 0 ? 1000.0 / tot : 0);
+        }
+
+        double frame_now = get_time();
+        frame_ms = ema(frame_ms, (frame_now - frame_prev) * 1000.0, 0.1);
+        frame_prev = frame_now;
+        if (!profile && epoch_counter % 60 == 0)
+        {
+            fprintf(stdout, "frame=%.2f ms (%.0f fps)\n", frame_ms, frame_ms > 0 ? 1000.0 / frame_ms : 0);
+        }
 
         float flip_buffer_start = get_time();
         RGFW_window_swapBuffers_OpenGL(window); // Swap draw and screen buffer
@@ -368,6 +577,23 @@ int main(int argc, char **argv)
             }
         }
         epoch_counter++;
+    }
+
+    // Final benchmark summary (one parseable line at exit, e.g. after -N frames).
+    if (profile)
+    {
+        double tot = 0;
+        fprintf(stdout, "SUMMARY ms:");
+        for (int i = 0; i < 8; i++)
+        {
+            fprintf(stdout, " %s=%.2f", pass_name[i], pass_ms[i]);
+            tot += pass_ms[i];
+        }
+        fprintf(stdout, " | total=%.2f (%.0f fps)\n", tot, tot > 0 ? 1000.0 / tot : 0);
+    }
+    else
+    {
+        fprintf(stdout, "SUMMARY frame=%.2f ms (%.0f fps)\n", frame_ms, frame_ms > 0 ? 1000.0 / frame_ms : 0);
     }
 
     // Clean up
@@ -406,6 +632,11 @@ void window_setup()
     hints->profile = RGFW_glCore;
 
     RGFW_windowFlags flags = RGFW_windowOpenGL;
+    if (no_keyfocus_steal) flags |= RGFW_windowNoFocusOnCreate;
+    // Same-space fullscreen path (--no-keyfocus-steal): cover the monitor with a
+    // borderless window in the *current* Space instead of native fullscreen, which
+    // would open a new Space and yank focus. Born borderless so no resize dance.
+    if (fullscreen && no_keyfocus_steal) flags |= RGFW_windowNoBorder;
 
     // Window spawn position. In fullscreen we place the window at the target
     // monitor's origin so RGFW_window_setFullscreen (which fullscreens onto
@@ -453,12 +684,25 @@ void window_setup()
         exit(EXIT_FAILURE);
     }
 
-    // Toggle fullscreen after creation (not via a create flag): RGFW targets the
-    // monitor the window currently sits on. Move the window onto the target
-    // monitor first -- cocoa's makeKeyWindow can pull a freshly-created window
-    // onto the active screen, ignoring the spawn coordinates.
-    if (fullscreen)
+    // Fullscreen has two modes: same-space borderless cover (no focus steal) vs
+    // native fullscreen Space (steals focus by design). See each branch.
+    if (fullscreen && no_keyfocus_steal)
     {
+        // Same-space cover: no native toggleFullScreen (which opens a new Space and
+        // steals focus). Cover the display in the current Space, above the menu bar.
+        // NoFocusOnCreate keeps key focus off at launch, so the keyboard stays with
+        // whatever the user was doing. Clicking the window grabs key focus on demand
+        // (canBecomeKeyWindow override in RGFW.h), which enables escape-to-quit;
+        // benchmarks that never click stay hands-off and use -N to auto-exit.
+        RGFW_window_move(window, win_x, win_y);
+        RGFW_window_coverDisplay(window);
+    }
+    else if (fullscreen)
+    {
+        // Native fullscreen Space; steals key focus by design (that's how macos
+        // opening a window in a new Space works, and what we want when we *do* want
+        // the keyboard). Move onto the target monitor first -- cocoa's makeKeyWindow
+        // can pull a freshly-created window onto the active screen.
         RGFW_window_move(window, win_x, win_y);
         RGFW_window_setFullscreen(window, RGFW_TRUE);
         // setFullscreen leaves a borderless status-level window. With the
@@ -595,13 +839,10 @@ void updateShaderWindowShape(int new_width, int new_height)
 
 void updateShaderBufferShape(int new_width, int new_height)
 {
-    float buffer_shape[2] = {(float)new_width, (float)new_height};
-    shader_set_uniform_vec(&screenShader, "buffer_size", 2, buffer_shape);
-    shader_set_uniform_vec(&densityShader, "buffer_size", 2, buffer_shape);
-    // shader_set_uniform_vec(&positionShader, "buffer_size", 2, buffer_shape);
-    // shader_set_uniform_vec(&velocityShader, "buffer_size", 2, buffer_shape);
-    // shader_set_uniform_vec(&copyShader, "buffer_size", 2, buffer_shape);
-    shader_set_uniform_vec(&trailShader, "buffer_size", 2, buffer_shape);
+    // buffer_size is dead: the point passes now read positions as PBO attributes
+    // instead of mapping gl_VertexID -> texel, so no shader references it anymore.
+    (void)new_width;
+    (void)new_height;
 }
 
 //===================================================
@@ -646,9 +887,48 @@ void buffer_setup()
     // Calculate size of the physics buffer
     int PBwidth = ceil(sqrt(P));
     int PBheight = ceil(P / sqrt(P));
+    PB_width = PBwidth;
+    PB_height = PBheight;
     fprintf(stdout, "%d points\n", P);
     fprintf(stdout, "Physics framebuffer shape: %d x %d\n", PBwidth, PBheight);
     updateShaderBufferShape(PBwidth, PBheight);
+
+    // PBOs sized to the full physics buffer (RG = 2 floats/texel). Filled each frame
+    // by glReadPixels(FBO->PBO), then reused as GL_ARRAY_BUFFER so the point passes
+    // read positions/velocities as streamed attributes instead of vertex texture fetch.
+    size_t pb_bytes = (size_t)PBwidth * PBheight * 2 * sizeof(float);
+    glGenBuffers(1, &pbo_pos);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
+    glBufferData(GL_PIXEL_PACK_BUFFER, pb_bytes, NULL, GL_DYNAMIC_COPY);
+    glGenBuffers(1, &pbo_vel);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_vel);
+    glBufferData(GL_PIXEL_PACK_BUFFER, pb_bytes, NULL, GL_DYNAMIC_COPY);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    // Wire the PBOs as vertex attributes (position = loc 0, velocity = loc 1) on the
+    // still-bound VAO, so the point passes stream them instead of vertex texture fetch.
+    glBindBuffer(GL_ARRAY_BUFFER, pbo_pos);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, pbo_vel);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+    // Index buffer + CPU scratch for the tile-coherent draw order (rebuild_sort_order).
+    glGenBuffers(1, &ibo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (size_t)PBwidth * PBheight * sizeof(unsigned int), NULL, GL_DYNAMIC_DRAW);
+    {
+        int tilesW = (width + sort_tile - 1) / sort_tile;
+        int tilesH = (height + sort_tile - 1) / sort_tile;
+        sort_idx = (unsigned int *)malloc((size_t)P * sizeof(unsigned int));
+        sort_key = (int *)malloc((size_t)P * sizeof(int));
+        sort_counts = (int *)malloc(((size_t)tilesW * tilesH + 1) * sizeof(int));
+        // Identity order until the first rebuild, so frame 0 still draws every particle.
+        for (int i = 0; i < P; i++) sort_idx[i] = (unsigned int)i;
+        glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (size_t)P * sizeof(unsigned int), sort_idx);
+    }
 
     // Initalise textures and the associated framebuffers
     glGenTextures(8, textures);
@@ -692,6 +972,7 @@ void buffer_setup()
 
     fprintf(stdout, "Allocating buffers...\n");
     buffer_allocate(&positionBuffer, current, positionBufferIndex1, PBwidth, PBheight, (const char *)positions);
+
     free(positions);
 
     // Texture 2,3,4 - position buffer 2, velocity buffer 1 and 2

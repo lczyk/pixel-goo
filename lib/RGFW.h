@@ -922,6 +922,7 @@ typedef RGFW_ENUM(u32, RGFW_windowFlags) {
 	RGFW_windowOpenGL = RGFW_BIT(17), /*!< create an OpenGL context (you can also do this manually with RGFW_window_createContext_OpenGL) */
 	RGFW_windowEGL = RGFW_BIT(18), /*!< create an EGL context (you can also do this manually with RGFW_window_createContext_EGL) */
 	RGFW_noDeinitOnClose = RGFW_BIT(19), /*!< do not auto deinit RGFW if the window closes and this is the last window open */
+	RGFW_windowNoFocusOnCreate = RGFW_BIT(20), /*!< show the window without activating the app or stealing key focus (macOS) */
 	RGFW_windowedFullscreen = RGFW_windowNoBorder | RGFW_windowMaximize,
 	RGFW_windowCaptureRawMouse = RGFW_windowCaptureMouse | RGFW_windowRawMouse
 };
@@ -2049,6 +2050,13 @@ RGFWDEF void RGFW_window_restore(RGFW_window* win);
  * @param floating RGFW_TRUE to float, RGFW_FALSE to disable
 */
 RGFWDEF void RGFW_window_setFloating(RGFW_window* win, RGFW_bool floating);
+
+/**!
+ * @brief pixel-goo local patch: cover the whole display in the current Space
+ *        (no native fullscreen Space, so no key-focus steal). macos only.
+ * @param win a pointer to the target window
+*/
+RGFWDEF void RGFW_window_coverDisplay(RGFW_window* win);
 
 /**!
  * @brief sets the opacity level of the window
@@ -13133,6 +13141,13 @@ static u32 RGFW_OnClose(id self) {
 static bool RGFW__osxAcceptsFirstResponder(void) { return true; }
 static bool RGFW__osxPerformKeyEquivalent(id event) { RGFW_UNUSED(event); return true; }
 
+/* pixel-goo local patch: accept the activating click. When the app is inactive
+ * (same-space --no-keyfocus-steal cover, launched from another monitor/Space),
+ * the first click on the window normally only activates the app and is swallowed,
+ * so the view doesn't become first responder and esc is dead until a second click.
+ * Returning YES makes the first click count, so one click grabs key focus + esc. */
+static BOOL RGFW__osxAcceptsFirstMouse(id self, SEL _cmd, id event) { RGFW_UNUSED(self); RGFW_UNUSED(_cmd); RGFW_UNUSED(event); return YES; }
+
 static NSDragOperation RGFW__osxDraggingEntered(id self, SEL sel, id sender) {
 	RGFW_UNUSED(sel);
 
@@ -13331,6 +13346,10 @@ static void RGFW__osxWindowBecameKey(id self, SEL sel) {
 	object_getInstanceVariable(self, "RGFW_window", (void**)&win);
 	if (win == NULL) return;
 
+	/* pixel-goo local patch: route keyDown to the view as soon as the window is key,
+	 * so esc works on the first activating click rather than needing a second one. */
+	((void(*)(id, SEL, id))objc_msgSend)((id)win->src.window, sel_registerName("makeFirstResponder:"), (id)win->src.view);
+
 	RGFW_windowFocusCallback(win, RGFW_TRUE);
 }
 
@@ -13396,6 +13415,13 @@ static void RGFW__osxViewDidChangeBackingProperties(id self, SEL _cmd) {
 }
 
 static BOOL RGFW__osxWantsUpdateLayer(id self, SEL _cmd) { RGFW_UNUSED(self); RGFW_UNUSED(_cmd); return YES; }
+
+/* pixel-goo local patch: a borderless NSWindow returns canBecomeKeyWindow = NO
+ * by default, so a same-space borderless cover (--no-keyfocus-steal) can never be
+ * clicked into key focus -> esc-to-quit dead even after clicking it. Override to
+ * YES so a click makes it key and keyDown starts flowing. Harmless for bordered
+ * windows (already YES). */
+static BOOL RGFW__osxCanBecomeKeyWindow(id self, SEL _cmd) { RGFW_UNUSED(self); RGFW_UNUSED(_cmd); return YES; }
 
 static void RGFW__osxUpdateLayer(id self, SEL _cmd) {
 	RGFW_UNUSED(self); RGFW_UNUSED(_cmd);
@@ -13768,6 +13794,9 @@ i32 RGFW_initPlatform(void) {
 	class_addMethod(objc_getClass("NSWindowClass"), sel_registerName("acceptsFirstResponder:"), (IMP)(void*)RGFW__osxAcceptsFirstResponder, 0);
 	class_addMethod(objc_getClass("NSWindowClass"), sel_registerName("performKeyEquivalent:"), (IMP)(void*)RGFW__osxPerformKeyEquivalent, 0);
 
+	/* pixel-goo local patch: let borderless windows become key (see fn comment). */
+	class_replaceMethod(objc_getClass("NSWindow"), sel_registerName("canBecomeKeyWindow"), (IMP)RGFW__osxCanBecomeKeyWindow, "B@:");
+
 	_RGFW->NSApp = objc_msgSend_id(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
 
 	NSRetain(_RGFW->NSApp);
@@ -13804,6 +13833,7 @@ i32 RGFW_initPlatform(void) {
 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("mouseExited:"), (IMP)RGFW__osxMouseExited, "v@:@");
 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("flagsChanged:"), (IMP)RGFW__osxFlagsChanged, "v@:@");
 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_getUid("acceptsFirstResponder"), (IMP)RGFW__osxAcceptsFirstResponder, "B@:");
+		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("acceptsFirstMouse:"), (IMP)RGFW__osxAcceptsFirstMouse, "B@:@");
 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("initWithRGFWWindow:"), (IMP)RGFW__osxCustomInitWithRGFWWindow, "@@:{CGRect={CGPoint=dd}{CGSize=dd}}");
 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("wantsUpdateLayer"), (IMP)RGFW__osxWantsUpdateLayer, "B@:");
 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("updateLayer"), (IMP)RGFW__osxUpdateLayer, "v@:");
@@ -13850,7 +13880,11 @@ void RGFW_osx_initView(RGFW_window* win) {
 		trackingArea,
 		sel_registerName("initWithRect:options:owner:userInfo:"),
 		contentRect,
-		NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect,
+		/* pixel-goo local patch: + NSTrackingMouseMoved so the view gets continuous
+		 * mouseMoved via the tracking area even when the window isn't key. Without it,
+		 * a non-key window (same-space --no-keyfocus-steal cover) only sees enter/exit
+		 * and the cursor position stales until clicked into focus. */
+		NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect,
 		(id)win->src.view,
 		nil
 	);
@@ -13909,14 +13943,19 @@ RGFW_window* RGFW_createWindowPlatform(const char* name, RGFW_windowFlags flags,
 		NSColor_colorWithSRGB(0, 0, 0, 0));
 	}
 
-	/* Show the window */
-	objc_msgSend_void_bool((id)_RGFW->NSApp, sel_registerName("activateIgnoringOtherApps:"), true);
+	/* Show the window. RGFW_windowNoFocusOnCreate orders it front without activating
+	 * the app or making it key, so it doesn't steal keyboard focus (e.g. benchmarks). */
+	if (flags & RGFW_windowNoFocusOnCreate) {
+		((id(*)(id, SEL, SEL))objc_msgSend)((id)win->src.window, sel_registerName("orderFront:"), NULL);
+	} else {
+		objc_msgSend_void_bool((id)_RGFW->NSApp, sel_registerName("activateIgnoringOtherApps:"), true);
 
-	if (_RGFW->root == NULL) {
-		objc_msgSend_void(win->src.window, sel_registerName("makeMainWindow"));
+		if (_RGFW->root == NULL) {
+			objc_msgSend_void(win->src.window, sel_registerName("makeMainWindow"));
+		}
+
+		objc_msgSend_void(win->src.window, sel_registerName("makeKeyWindow"));
 	}
-
-	objc_msgSend_void(win->src.window, sel_registerName("makeKeyWindow"));
 
 	NSRetain(win->src.window);
 
@@ -14163,6 +14202,24 @@ void RGFW_window_setFloating(RGFW_window* win, RGFW_bool floating) {
     RGFW_ASSERT(win != NULL);
     if (floating) objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), kCGFloatingWindowLevelKey);
     else 		  objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), kCGNormalWindowLevelKey);
+}
+
+/* pixel-goo local patch: cover the whole display in the *current* Space (no
+ * native fullscreen Space, hence no focus steal). Raises the window above the
+ * menu bar (NSStatusWindowLevel = 25, > kCGMainMenuWindowLevel = 24) and sizes
+ * it to the screen's full frame. macos only; used by --no-keyfocus-steal. */
+void RGFW_window_coverDisplay(RGFW_window* win) {
+	RGFW_ASSERT(win != NULL);
+	id screen = objc_msgSend_id((id)win->src.window, sel_registerName("screen"));
+	NSRect r = ((NSRect(*)(id, SEL))abi_objc_msgSend_stret)(screen, sel_registerName("frame"));
+	objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), (void*)(intptr_t)25);
+	((void(*)(id, SEL, NSRect))objc_msgSend)
+		((id)win->src.view, sel_registerName("setFrame:"), (NSRect){{0, 0}, r.size});
+	((void(*)(id, SEL, NSRect, bool, bool))objc_msgSend)
+		((id)win->src.window, sel_registerName("setFrame:display:animate:"), r, true, false);
+	((id(*)(id, SEL, SEL))objc_msgSend)((id)win->src.window, sel_registerName("orderFront:"), (SEL)NULL);
+	win->x = (i32)r.origin.x; win->y = (i32)r.origin.y;
+	win->w = (i32)r.size.width; win->h = (i32)r.size.height;
 }
 
 void RGFW_window_setOpacity(RGFW_window* win, u8 opacity) {

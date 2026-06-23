@@ -1,11 +1,28 @@
-/** dropt.c
+/** dropt.h -- single-header build
   *
   * A deliberately rudimentary command-line option parser.
   *
+  * Version 2.0.0
+  *
   * Copyright (C) 2006-2018 James D. Lin <jamesdlin@berkeley.edu>
   *
-  * The latest version of this file can be downloaded from:
-  * <http://www.taenarum.com/software/dropt/>
+  * The latest version of the original (multi-file) library can be downloaded
+  * from: <http://www.taenarum.com/software/dropt/>
+  *
+  * ALTERED SOURCE: this is a modified version of dropt. The original
+  * dropt.h, dropt.c, dropt_string.h, dropt_string.c and dropt_handlers.c have
+  * been merged into this single header, stb-style. No functional changes were
+  * made to the library logic. To use it:
+  *
+  *     // in exactly ONE translation unit:
+  *     #define DROPT_IMPLEMENTATION
+  *     #include "dropt.h"
+  *
+  *     // everywhere else, just:
+  *     #include "dropt.h"
+  *
+  * Optionally `#define DROPTDEF static inline` before the implementation
+  * include to make the whole library header-only / file-local.
   *
   * This software is provided 'as-is', without any express or implied
   * warranty.  In no event will the authors be held liable for any damages
@@ -26,14 +43,1001 @@
   * 3. This notice may not be removed or altered from any source distribution.
   */
 
+#ifndef DROPT_H
+#define DROPT_H
+
+#ifndef DROPTDEF
+/* Goes before every public dropt declaration/definition. Override to control
+   linkage or visibility, e.g. `#define DROPTDEF static inline`. */
+#define DROPTDEF
+#endif
+
+
+
+#include <stdio.h>
+#include <wchar.h>
+
+#if __STDC_VERSION__ >= 199901L
+    #include <stdint.h>
+    typedef uintptr_t dropt_uintptr;
+#else
+    typedef size_t dropt_uintptr;
+#endif
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
+#ifndef DROPT_USE_WCHAR
+#if defined _UNICODE && (defined _MSC_VER || defined DROPT_NO_STRING_BUFFERS)
+#define DROPT_USE_WCHAR 1
+#endif
+#endif
+
+#ifdef DROPT_USE_WCHAR
+    /* This may be used for both char and string literals. */
+    #define DROPT_TEXT_LITERAL(s) L ## s
+
+    typedef wchar_t dropt_char;
+#else
+    #define DROPT_TEXT_LITERAL(s) s
+
+    typedef char dropt_char;
+#endif
+
+
+enum
+{
+    /* Errors in the range [0x00, 0x7F] are reserved for dropt. */
+    dropt_error_none,
+    dropt_error_unknown,
+    dropt_error_bad_configuration,
+    dropt_error_insufficient_memory,
+    dropt_error_invalid_option,
+    dropt_error_insufficient_arguments,
+    dropt_error_mismatch,
+    dropt_error_overflow,
+    dropt_error_underflow,
+
+    /* Errors in the range [0x80, 0xFFFF] are free for clients to use. */
+    dropt_error_custom_start = 0x80,
+    dropt_error_custom_last = 0xFFFF
+};
+typedef unsigned int dropt_error;
+
+typedef unsigned char dropt_bool;
+
+/* Opaque. */
+typedef struct dropt_context dropt_context;
+
+/* Forward declarations. */
+typedef struct dropt_option dropt_option;
+
+
+/** `dropt_option_handler_func` callbacks are responsible for parsing
+  * individual options and storing the parsed value.
+  *
+  * `dropt_option_handler_decl` may be used for declaring the callback
+  * functions (see the stock option handlers below for examples).
+  * `dropt_option_handler_func` is the actual function pointer type.
+  *
+  * `option` points to the `dropt_option` entry that matched the option
+  * supplied by the user.  This will never be `NULL` when dropt invokes the
+  * handler.
+  *
+  * `optionArgument` will be `NULL` if no argument is specified for an option.
+  * It will be the empty string if the user explicitly passed an empty string
+  * as the argument (e.g. `--option=""`).
+  *
+  * An option that doesn't expect an argument still can receive a non-null
+  * value for `optionArgument` if the user explicitly specified one (e.g.
+  * `--option=arg`).
+  *
+  * If the option's argument is optional, the handler might be called twice:
+  * once with a candidate argument, and if that argument is rejected by the
+  * handler, again with no argument.  Handlers should be aware of this if they
+  * have side-effects.
+  *
+  * `dest` is the client-specified pointer to a variable for the handler to
+  * modify.
+  */
+typedef dropt_error dropt_option_handler_decl(dropt_context* context,
+                                              const dropt_option* option,
+                                              const dropt_char* optionArgument,
+                                              void* dest);
+typedef dropt_option_handler_decl* dropt_option_handler_func;
+
+/** `dropt_error_handler_func` callbacks are responsible for generating error
+  * messages.  The returned string must be allocated on the heap and must be
+  * freeable with `free()`.
+  */
+typedef dropt_char* (*dropt_error_handler_func)(dropt_error error,
+                                                const dropt_char* optionName,
+                                                const dropt_char* optionArgument,
+                                                void* handlerData);
+
+/** `dropt_strncmp_func` callbacks allow callers to provide their own (possibly
+  * case-insensitive) string comparison function.
+  */
+typedef int (*dropt_strncmp_func)(const dropt_char* s, const dropt_char* t,
+                                  size_t n);
+
+
+/** Properties defining each option:
+  *
+  * short_name:
+  *     The option's short name (e.g. the 'h' in `-h`).
+  *     Use '\0' if the option has no short name.
+  *
+  * long_name:
+  *     The option's long name (e.g. "help" in `--help`).
+  *     Use `NULL` if the option has no long name.
+  *
+  * description:
+  *     The description shown when generating help.
+  *     May be `NULL` for undocumented options.
+  *
+  * arg_description:
+  *     The description for the option's argument (e.g. `--option=argument` or
+  *     `--option argument`), printed when generating help.
+  *     Use `NULL` if the option does not take an argument.
+  *
+  * handler:
+  *     The handler callback and data invoked in response to encountering the
+  *     option.
+  *
+  * dest:
+  *     The address of a variable for the handler to modify, if necessary.
+  *
+  * attr:
+  *     Miscellaneous attributes.  See below.
+  *
+  * extra_data:
+  *     Additional callback data for the handler.
+  */
+struct dropt_option
+{
+    dropt_char short_name;
+    const dropt_char* long_name;
+    const dropt_char* description;
+    const dropt_char* arg_description;
+    dropt_option_handler_func handler;
+    void* dest;
+    unsigned int attr;
+    dropt_uintptr extra_data;
+};
+
+
+/** Bitwise flags for option attributes:
+  *
+  * dropt_attr_halt:
+  *     Stop processing when this option is encountered.
+  *
+  * dropt_attr_hidden:
+  *     Don't list the option when generating help.  Use this for undocumented
+  *     options.
+  *
+  * dropt_attr_optional_val:
+  *     The option's argument is optional.  If an option has this attribute,
+  *     the handler callback may be invoked twice (once with a potential
+  *     argument, and if that fails, again with a `NULL` argument).
+  */
+enum
+{
+    dropt_attr_halt = (1 << 0),
+    dropt_attr_hidden = (1 << 1),
+    dropt_attr_optional_val = (1 << 2)
+};
+
+
+typedef struct dropt_help_params
+{
+    unsigned int indent;
+    unsigned int description_start_column;
+    dropt_bool blank_lines_between_options;
+} dropt_help_params;
+
+
+DROPTDEF dropt_context* dropt_new_context(const dropt_option* options);
+DROPTDEF void dropt_free_context(dropt_context* context);
+
+DROPTDEF const dropt_option* dropt_get_options(const dropt_context* context);
+
+DROPTDEF void dropt_set_error_handler(dropt_context* context,
+                             dropt_error_handler_func handler,
+                             void* handlerData);
+DROPTDEF void dropt_set_strncmp(dropt_context* context, dropt_strncmp_func cmp);
+
+/* Use this only for backward compatibility purposes. */
+DROPTDEF void dropt_allow_concatenated_arguments(dropt_context* context,
+                                        dropt_bool allow);
+
+DROPTDEF dropt_char** dropt_parse(dropt_context* context, int argc, dropt_char** argv);
+
+DROPTDEF dropt_error dropt_get_error(const dropt_context* context);
+DROPTDEF void dropt_get_error_details(const dropt_context* context,
+                             dropt_char** optionName,
+                             dropt_char** optionArgument);
+DROPTDEF const dropt_char* dropt_get_error_message(dropt_context* context);
+DROPTDEF void dropt_clear_error(dropt_context* context);
+
+#ifndef DROPT_NO_STRING_BUFFERS
+DROPTDEF dropt_char* dropt_default_error_handler(dropt_error error,
+                                        const dropt_char* optionName,
+                                        const dropt_char* optionArgument);
+
+DROPTDEF void dropt_init_help_params(dropt_help_params* helpParams);
+DROPTDEF dropt_char* dropt_get_help(const dropt_context* context,
+                           const dropt_help_params* helpParams);
+DROPTDEF void dropt_print_help(FILE* f, const dropt_context* context,
+                      const dropt_help_params* helpParams);
+#endif
+
+
+/* Stock option handlers for common types. */
+dropt_option_handler_decl dropt_handle_bool;
+dropt_option_handler_decl dropt_handle_verbose_bool;
+dropt_option_handler_decl dropt_handle_int;
+dropt_option_handler_decl dropt_handle_uint;
+dropt_option_handler_decl dropt_handle_double;
+dropt_option_handler_decl dropt_handle_string;
+dropt_option_handler_decl dropt_handle_const;
+
+#define DROPT_MISUSE(message) dropt_misuse(message, __FILE__, __LINE__)
+DROPTDEF void dropt_misuse(const char* message, const char* filename, int line);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+
+
+#include <stdarg.h>
+
+
+#ifdef DROPT_USE_WCHAR
+    #define dropt_strlen wcslen
+    #define dropt_strcmp wcscmp
+    #define dropt_strncmp wcsncmp
+    #define dropt_strchr wcschr
+    #define dropt_strtol wcstol
+    #define dropt_strtoul wcstoul
+    #define dropt_strtod wcstod
+    #define dropt_tolower towlower
+    #define dropt_fputs fputws
+#else
+    #define dropt_strlen strlen
+    #define dropt_strcmp strcmp
+    #define dropt_strncmp strncmp
+    #define dropt_strchr strchr
+    #define dropt_strtol strtol
+    #define dropt_strtoul strtoul
+    #define dropt_strtod strtod
+    #define dropt_tolower tolower
+    #define dropt_fputs fputs
+#endif
+
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+DROPTDEF void* dropt_safe_malloc(size_t numElements, size_t elementSize);
+DROPTDEF void* dropt_safe_realloc(void* p, size_t numElements, size_t elementSize);
+
+DROPTDEF dropt_char* dropt_strdup(const dropt_char* s);
+DROPTDEF dropt_char* dropt_strndup(const dropt_char* s, size_t n);
+DROPTDEF int dropt_stricmp(const dropt_char* s, const dropt_char* t);
+DROPTDEF int dropt_strnicmp(const dropt_char* s, const dropt_char* t, size_t n);
+
+
+#ifndef DROPT_NO_STRING_BUFFERS
+typedef struct dropt_stringstream dropt_stringstream;
+
+DROPTDEF int dropt_vsnprintf(dropt_char* s, size_t n, const dropt_char* format, va_list args);
+DROPTDEF int dropt_snprintf(dropt_char* s, size_t n, const dropt_char* format, ...);
+
+DROPTDEF dropt_char* dropt_vasprintf(const dropt_char* format, va_list args);
+DROPTDEF dropt_char* dropt_asprintf(const dropt_char* format, ...);
+
+DROPTDEF dropt_stringstream* dropt_ssopen(void);
+DROPTDEF void dropt_ssclose(dropt_stringstream* ss);
+
+DROPTDEF void dropt_ssclear(dropt_stringstream* ss);
+DROPTDEF dropt_char* dropt_ssfinalize(dropt_stringstream* ss);
+DROPTDEF const dropt_char* dropt_ssgetstring(const dropt_stringstream* ss);
+
+DROPTDEF int dropt_vssprintf(dropt_stringstream* ss, const dropt_char* format, va_list args);
+DROPTDEF int dropt_ssprintf(dropt_stringstream* ss, const dropt_char* format, ...);
+#endif /* DROPT_NO_STRING_BUFFERS */
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+
+#endif /* DROPT_H */
+
+#ifdef DROPT_IMPLEMENTATION
+#ifndef DROPT_IMPLEMENTATION_INCLUDED
+#define DROPT_IMPLEMENTATION_INCLUDED
+
+/* ===== dropt_string.c ===== */
+
+#ifdef _MSC_VER
+    #include <tchar.h>
+#endif
+
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <ctype.h>
+#include <wctype.h>
+#include <stdio.h>
+#include <assert.h>
+
+#if __STDC_VERSION__ >= 199901L
+    #include <stdint.h>
+#else
+    /* Compatibility junk for things that don't yet support ISO C99. */
+    #if defined _MSC_VER || defined __BORLANDC__
+        #ifndef va_copy
+            #define va_copy(dest, src) (dest = (src))
+        #endif
+    #else
+        #ifndef va_copy
+            #error Unsupported platform.  va_copy is not defined.
+        #endif
+    #endif
+
+    #ifndef SIZE_MAX
+        #define SIZE_MAX ((size_t) -1)
+    #endif
+#endif
+
+
+#ifndef MAX
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#endif
+
+#ifndef MIN
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+#endif
+
+#ifdef DROPT_DEBUG_STRING_BUFFERS
+    enum { default_stringstream_buffer_size = 1 };
+    #define GROWN_STRINGSTREAM_BUFFER_SIZE(oldSize, minAmount) \
+        ((oldSize) + (minAmount))
+#else
+    enum { default_stringstream_buffer_size = 256 };
+    #define GROWN_STRINGSTREAM_BUFFER_SIZE(oldSize, minAmount) \
+        MAX((oldSize) * 2, (oldSize) + (minAmount))
+#endif
+
+
+#ifndef DROPT_NO_STRING_BUFFERS
+struct dropt_stringstream
+{
+    /* The string buffer. */
+    dropt_char* string;
+
+    /* Size of the string buffer, in `dropt_char`s, including space for `NUL`.
+     */
+    size_t maxSize;
+
+    /* Number of elements used in the string buffer, excluding `NUL`. */
+    size_t used;
+};
+#endif
+
+
+/** dropt_safe_malloc
+  *
+  *     A version of `malloc` that checks for integer overflow.
+  *
+  * PARAMETERS:
+  *     IN numElements : The number of elements to allocate.
+  *     IN elementSize : The size of each element, in bytes.
+  *
+  * RETURNS:
+  *     A pointer to the allocated memory.
+  *     Returns `NULL` if `numElements` is 0.
+  *     Returns `NULL` on error.
+  */
+DROPTDEF void*
+dropt_safe_malloc(size_t numElements, size_t elementSize)
+{
+    return dropt_safe_realloc(NULL, numElements, elementSize);
+}
+
+
+/** dropt_safe_realloc
+  *
+  *     Wrapper around `realloc` to check for integer overflow.
+  *
+  * PARAMETERS:
+  *     IN/OUT p       : A pointer to the memory block to resize.
+  *                      If `NULL`, a new memory block of the specified size
+  *                        will be allocated.
+  *     IN numElements : The number of elements to allocate.
+  *                      If 0, frees `p`.
+  *     IN elementSize : The size of each element, in bytes.
+  *
+  * RETURNS:
+  *     A pointer to the allocated memory.
+  *     Returns `NULL` if `numElements` is 0.
+  *     Returns `NULL` on error.
+  */
+DROPTDEF void*
+dropt_safe_realloc(void* p, size_t numElements, size_t elementSize)
+{
+    size_t numBytes;
+
+    /* `elementSize` shouldn't legally be 0, but we check for it in case a
+     * caller got the argument order wrong.
+     */
+    if (numElements == 0 || elementSize == 0)
+    {
+        /* The behavior of `realloc(p, 0)` is implementation-defined.  Let's
+         * enforce a particular behavior.
+         */
+        free(p);
+
+        assert(elementSize != 0);
+        return NULL;
+    }
+
+    numBytes = numElements * elementSize;
+    if (numBytes / elementSize != numElements)
+    {
+        /* Overflow. */
+        return NULL;
+    }
+
+    return realloc(p, numBytes);
+}
+
+
+/** dropt_strdup
+  *
+  *     Duplicates a string.
+  *
+  * PARAMETERS:
+  *     IN s : A `NUL`-terminated string to duplicate.
+  *
+  * RETURNS:
+  *     The duplicated string.  The caller is responsible for calling `free()`
+  *       on it when no longer needed.
+  *     Returns `NULL` on error.
+  */
+DROPTDEF dropt_char*
+dropt_strdup(const dropt_char* s)
+{
+    return dropt_strndup(s, SIZE_MAX);
+}
+
+
+/** dropt_strndup
+  *
+  *     Duplicates the first `n` characters of a string.
+  *
+  * PARAMETERS:
+  *     IN s : The string to duplicate.
+  *     IN n : The maximum number of `dropt_char`s to copy, excluding the
+  *              `NUL`-terminator.
+  *
+  * RETURNS:
+  *     The duplicated string, which is always `NUL`-terminated.  The caller is
+  *       responsible for calling `free()` on it when no longer needed.
+  *     Returns `NULL` on error.
+  */
+DROPTDEF dropt_char*
+dropt_strndup(const dropt_char* s, size_t n)
+{
+    dropt_char* copy;
+    size_t len = 0;
+
+    assert(s != NULL);
+
+    while (len < n && s[len] != DROPT_TEXT_LITERAL('\0'))
+    {
+        len++;
+    }
+
+    if (len + 1 < len)
+    {
+        /* This overflow check shouldn't be strictly necessary. `len` can be at
+         * most `SIZE_MAX`, so `SIZE_MAX + 1` can wrap around to 0, but
+         * `dropt_safe_malloc` will return `NULL` for a 0-sized allocation.
+         * However, favor defensive paranoia.
+         */
+        return NULL;
+    }
+
+    copy = dropt_safe_malloc(len + 1 /* NUL */, sizeof *copy);
+    if (copy != NULL)
+    {
+        memcpy(copy, s, len * sizeof *copy);
+        copy[len] = DROPT_TEXT_LITERAL('\0');
+    }
+
+    return copy;
+}
+
+
+/** dropt_stricmp
+  *
+  *     Compares two `NUL`-terminated strings ignoring case differences.  Not
+  *       recommended for non-ASCII strings.
+  *
+  * PARAMETERS:
+  *     IN s, t : The strings to compare.
+  *
+  * RETURNS:
+  *     0 if the strings are equivalent,
+  *     < 0 if `s` should precede `t`,
+  *     > 0 if `s` should follow `t`.
+  */
+DROPTDEF int
+dropt_stricmp(const dropt_char* s, const dropt_char* t)
+{
+    assert(s != NULL);
+    assert(t != NULL);
+    return dropt_strnicmp(s, t, SIZE_MAX);
+}
+
+
+/** dropt_strnicmp
+  *
+  *     Compares the first `n` characters of two strings, ignoring case
+  *       differences.  Not recommended for non-ASCII strings.
+  *
+  * PARAMETERS:
+  *     IN s, t : The strings to compare.
+  *     IN n    : The maximum number of `dropt_char`s to compare.
+  *
+  * RETURNS:
+  *     0 if the strings are equivalent,
+  *     < 0 if `s` should precede `t`,
+  *     > 0 if `s` should follow `t`.
+  */
+DROPTDEF int
+dropt_strnicmp(const dropt_char* s, const dropt_char* t, size_t n)
+{
+    assert(s != NULL);
+    assert(t != NULL);
+
+    if (s == t) { return 0; }
+
+    while (n--)
+    {
+        if (*s == DROPT_TEXT_LITERAL('\0') && *t == DROPT_TEXT_LITERAL('\0'))
+        {
+            break;
+        }
+        else if (*s == *t || dropt_tolower(*s) == dropt_tolower(*t))
+        {
+            s++;
+            t++;
+        }
+        else
+        {
+            return (dropt_tolower(*s) < dropt_tolower(*t))
+                   ? -1
+                   : +1;
+        }
+    }
+
+    return 0;
+}
+
+
+#ifndef DROPT_NO_STRING_BUFFERS
+/** dropt_vsnprintf
+  *
+  *     `vsnprintf` wrapper to provide ISO C99-compliant behavior.
+  *
+  * PARAMETERS:
+  *     OUT s     : The destination buffer.  May be `NULL` if `n` is 0.
+  *                 If non-`NULL`, always `NUL`-terminated.
+  *     IN n      : The size of the destination buffer, measured in
+  *                   `dropt_char`s.
+  *     IN format : `printf`-style format specifier.  Must not be `NULL`.
+  *     IN args   : Arguments to insert into the formatted string.
+  *
+  * RETURNS:
+  *     The number of characters that would be written to the destination
+  *       buffer if it's sufficiently large, excluding the `NUL`-terminator.
+  *     Returns -1 on error.
+  */
+DROPTDEF int
+dropt_vsnprintf(dropt_char* s, size_t n, const dropt_char* format, va_list args)
+{
+#if __STDC_VERSION__ >= 199901L || __GNUC__
+    /* ISO C99-compliant.
+     *
+     * As far as I can tell, gcc's implementation of `vsnprintf` has always
+     * matched the behavior required by the C99 standard (which is to return
+     * the necessary buffer size).
+     *
+     * Note that this won't work with `wchar_t` because there is no true,
+     * standard `wchar_t` equivalent of `snprintf`. `swprintf` comes close but
+     * doesn't return the necessary buffer size (and the standard does not
+     * provide a guaranteed way to test if truncation occurred), and its
+     * format string can't be used interchangeably with `snprintf`.
+     *
+     * It's simpler not to support `wchar_t` on non-Windows platforms.
+     */
+    assert(format != NULL);
+    return vsnprintf(s, n, format, args);
+#elif defined __BORLANDC__
+    /* Borland's compiler neglects to `NUL`-terminate. */
+    int ret;
+    assert(format != NULL);
+    ret = vsnprintf(s, n, format, args);
+    if (n != 0) { s[n - 1] = DROPT_TEXT_LITERAL('\0'); }
+    return ret;
+#elif defined _MSC_VER
+    /* `_vsntprintf` and `_vsnprintf_s` on Windows don't have C99 semantics;
+     * they return -1 if truncation occurs.
+     */
+    va_list argsCopy;
+    int ret;
+
+    assert(format != NULL);
+
+    va_copy(argsCopy, args);
+    ret = _vsctprintf(format, argsCopy);
+    va_end(argsCopy);
+
+    if (n != 0)
+    {
+        assert(s != NULL);
+
+    #if _MSC_VER >= 1400
+        (void) _vsntprintf_s(s, n, _TRUNCATE, format, args);
+    #else
+        /* This version doesn't necessarily `NUL`-terminate.  Sigh. */
+        (void) _vsnprintf(s, n, format, args);
+        s[n - 1] = DROPT_TEXT_LITERAL('\0');
+    #endif
+    }
+
+    return ret;
+
+#else
+    #error Unsupported platform.  dropt_vsnprintf unimplemented.
+    return -1;
+#endif
+}
+
+
+/** See `dropt_vsnprintf`. */
+DROPTDEF int
+dropt_snprintf(dropt_char* s, size_t n, const dropt_char* format, ...)
+{
+    int ret;
+    va_list args;
+    va_start(args, format);
+    ret = dropt_vsnprintf(s, n, format, args);
+    va_end(args);
+    return ret;
+}
+
+
+/** dropt_vasprintf
+  *
+  *     Allocates a formatted string with `vprintf` semantics.
+  *
+  * PARAMETERS:
+  *     IN format : `printf`-style format specifier.  Must not be `NULL`.
+  *     IN args   : Arguments to insert into the formatted string.
+  *
+  * RETURNS:
+  *     The formatted string, which is always NUL-terminated.  The caller is
+  *       responsible for calling `free()` on it when no longer needed.
+  *     Returns `NULL` on error.
+  */
+DROPTDEF dropt_char*
+dropt_vasprintf(const dropt_char* format, va_list args)
+{
+    dropt_char* s = NULL;
+    int len;
+    va_list argsCopy;
+    assert(format != NULL);
+
+    va_copy(argsCopy, args);
+    len = dropt_vsnprintf(NULL, 0, format, argsCopy);
+    va_end(argsCopy);
+
+    if (len >= 0)
+    {
+        size_t n = len + 1 /* NUL */;
+        s = dropt_safe_malloc(n, sizeof *s);
+        if (s != NULL)
+        {
+            dropt_vsnprintf(s, n, format, args);
+        }
+    }
+
+    return s;
+}
+
+
+/** See `dropt_vasprintf`. */
+DROPTDEF dropt_char*
+dropt_asprintf(const dropt_char* format, ...)
+{
+    dropt_char* s;
+
+    va_list args;
+    va_start(args, format);
+    s = dropt_vasprintf(format, args);
+    va_end(args);
+
+    return s;
+}
+
+
+/** dropt_ssopen
+  *
+  *     Constructs a new `dropt_stringstream`.
+  *
+  * RETURNS:
+  *     An initialized `dropt_stringstream`.  The caller is responsible for
+  *       calling either `dropt_ssclose()` or `dropt_ssfinalize()` on it when
+  *       no longer needed.
+  *     Returns `NULL` on error.
+  */
+DROPTDEF dropt_stringstream*
+dropt_ssopen(void)
+{
+    dropt_stringstream* ss = malloc(sizeof *ss);
+    if (ss != NULL)
+    {
+        ss->used = 0;
+        ss->maxSize = default_stringstream_buffer_size;
+        ss->string = dropt_safe_malloc(ss->maxSize, sizeof *ss->string);
+        if (ss->string == NULL)
+        {
+            free(ss);
+            ss = NULL;
+        }
+        else
+        {
+            ss->string[0] = DROPT_TEXT_LITERAL('\0');
+        }
+    }
+    return ss;
+}
+
+
+/** dropt_ssclose
+  *
+  *     Destroys a `dropt_stringstream`.
+  *
+  * PARAMETERS:
+  *     IN/OUT ss : The `dropt_stringstream`.
+  */
+DROPTDEF void
+dropt_ssclose(dropt_stringstream* ss)
+{
+    if (ss != NULL)
+    {
+        free(ss->string);
+        free(ss);
+    }
+}
+
+
+/** dropt_ssgetfreespace
+  *
+  * RETURNS:
+  *     The amount of free space in the `dropt_stringstream`'s internal buffer,
+  *       measured in `dropt_char`s.  Space used for the `NUL`-terminator is
+  *       considered free. (The amount of free space therefore is always
+  *       positive.)
+  */
+static size_t
+dropt_ssgetfreespace(const dropt_stringstream* ss)
+{
+    assert(ss != NULL);
+    assert(ss->maxSize > 0);
+    assert(ss->maxSize > ss->used);
+    return ss->maxSize - ss->used;
+}
+
+
+/** dropt_ssresize
+  *
+  *     Resizes a `dropt_stringstream`'s internal buffer.  If the requested
+  *     size is less than the amount of buffer already in use, the buffer will
+  *     be shrunk to the minimum size necessary.
+  *
+  * PARAMETERS:
+  *     IN/OUT ss : The `dropt_stringstream`.
+  *     IN n      : The desired buffer size, in `dropt_char`s.
+  *
+  * RETURNS:
+  *     The new size of the `dropt_stringstream`'s buffer in `dropt_char`s,
+  *       including space for a terminating `NUL`.
+  */
+static size_t
+dropt_ssresize(dropt_stringstream* ss, size_t n)
+{
+    assert(ss != NULL);
+
+    /* Don't allow shrinking if it will truncate the string. */
+    if (n < ss->maxSize) { n = MAX(n, ss->used + 1 /* NUL */); }
+
+    /* There should always be a buffer to point to. */
+    assert(n > 0);
+
+    if (n != ss->maxSize)
+    {
+        dropt_char* p = dropt_safe_realloc(ss->string, n, sizeof *ss->string);
+        if (p != NULL)
+        {
+            ss->string = p;
+            ss->maxSize = n;
+            assert(ss->maxSize > 0);
+         }
+    }
+    return ss->maxSize;
+}
+
+
+/** dropt_ssclear
+  *
+  *     Clears and re-initializes a `dropt_stringstream`.
+  *
+  * PARAMETERS:
+  *     IN/OUT ss : The `dropt_stringstream`.
+  */
+DROPTDEF void
+dropt_ssclear(dropt_stringstream* ss)
+{
+    assert(ss != NULL);
+
+    ss->string[0] = DROPT_TEXT_LITERAL('\0');
+    ss->used = 0;
+
+    dropt_ssresize(ss, default_stringstream_buffer_size);
+}
+
+
+/** dropt_ssfinalize
+  *
+  *     Finalizes a `dropt_stringstream`; returns the contained string and
+  *     destroys the `dropt_stringstream`.
+  *
+  * PARAMETERS:
+  *     IN/OUT ss : The `dropt_stringstream`.
+  *
+  * RETURNS:
+  *     The `dropt_stringstream`'s string, which is always `NUL`-terminated.
+  *       Note that the caller assumes ownership of the returned string and is
+  *       responsible for calling `free()` on it when no longer needed.
+  */
+DROPTDEF dropt_char*
+dropt_ssfinalize(dropt_stringstream* ss)
+{
+    dropt_char* s;
+    assert(ss != NULL);
+
+    /* Shrink to fit. */
+    dropt_ssresize(ss, 0);
+
+    s = ss->string;
+    ss->string = NULL;
+
+    dropt_ssclose(ss);
+
+    return s;
+}
+
+
+/** dropt_ssgetstring
+  *
+  * PARAMETERS:
+  *     IN ss : The `dropt_stringstream`.
+  *
+  * RETURNS:
+  *     The `dropt_stringstream`'s string, which is always `NUL`-terminated.
+  *       The returned string will no longer be valid if further operations are
+  *       performed on the `dropt_stringstream` or if the `dropt_stringstream`
+  *       is closed.
+  */
+DROPTDEF const dropt_char*
+dropt_ssgetstring(const dropt_stringstream* ss)
+{
+    assert(ss != NULL);
+    return ss->string;
+}
+
+
+/** dropt_vssprintf
+  *
+  *     Appends a formatted string with `vprintf` semantics to a
+  *     `dropt_stringstream`.
+  *
+  * PARAMETERS:
+  *     IN/OUT ss : The `dropt_stringstream`.
+  *     IN format : `printf`-style format specifier.  Must not be `NULL`.
+  *     IN args   : Arguments to insert into the formatted string.
+  *
+  * RETURNS:
+  *     The number of characters written to the `dropt_stringstream`, excluding
+  *       the `NUL`-terminator.
+  *     Returns a negative value on error.
+  */
+DROPTDEF int
+dropt_vssprintf(dropt_stringstream* ss, const dropt_char* format, va_list args)
+{
+    int n;
+    va_list argsCopy;
+    assert(ss != NULL);
+    assert(format != NULL);
+
+    va_copy(argsCopy, args);
+    n = dropt_vsnprintf(NULL, 0, format, argsCopy);
+    va_end(argsCopy);
+
+    if (n > 0)
+    {
+        size_t available = dropt_ssgetfreespace(ss);
+        if ((unsigned int) n >= available)
+        {
+            /* It's possible that `newSize < ss->maxSize` if
+             * `GROWN_STRINGSTREAM_BUFFER_SIZE()` overflows, but it should be
+             * safe since we'll recompute the available space.
+             */
+            size_t newSize = GROWN_STRINGSTREAM_BUFFER_SIZE(ss->maxSize, n);
+            dropt_ssresize(ss, newSize);
+            available = dropt_ssgetfreespace(ss);
+        }
+        assert(available > 0); /* Space always is reserved for NUL. */
+
+        /* `snprintf`'s family of functions return the number of characters
+         * that would be output with a sufficiently large buffer, excluding
+         * `NUL`.
+         */
+        n = dropt_vsnprintf(ss->string + ss->used, available, format, args);
+
+        /* We couldn't allocate enough space. */
+        if ((unsigned int) n >= available) { n = -1; }
+
+        if (n > 0) { ss->used += n; }
+    }
+    return n;
+}
+
+
+/** See `dropt_vssprintf`. */
+DROPTDEF int
+dropt_ssprintf(dropt_stringstream* ss, const dropt_char* format, ...)
+{
+    int n;
+
+    va_list args;
+    va_start(args, format);
+    n = dropt_vssprintf(ss, format, args);
+    va_end(args);
+
+    return n;
+}
+#endif /* DROPT_NO_STRING_BUFFERS */
+
+/* ===== dropt.c ===== */
+
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <wctype.h>
 #include <assert.h>
 
-#include "dropt.h"
-#include "dropt_string.h"
 
 #if __STDC_VERSION__ >= 199901L
     #include <stdint.h>
@@ -44,7 +1048,11 @@
         #define SIZE_MAX ((size_t) -1)
     #endif
 
+#if __STDC_VERSION__ >= 199901L
+    #include <stdbool.h>
+#else
     typedef enum { false, true } bool;
+#endif
 #endif
 
 #ifndef MIN
@@ -595,7 +1603,7 @@ set_short_option_error_details(dropt_context* context, dropt_error err,
   * RETURNS:
   *     The current error code waiting in the dropt context.
   */
-dropt_error
+DROPTDEF dropt_error
 dropt_get_error(const dropt_context* context)
 {
     if (context == NULL)
@@ -621,7 +1629,7 @@ dropt_get_error(const dropt_context* context)
   *                            string.
   *                          Pass `NULL` if unwanted.
   */
-void
+DROPTDEF void
 dropt_get_error_details(const dropt_context* context,
                         dropt_char** optionName, dropt_char** optionArgument)
 {
@@ -650,7 +1658,7 @@ dropt_get_error_details(const dropt_context* context,
   *       `dropt_get_error_message` may invalidate a previously-returned
   *       string.
   */
-const dropt_char*
+DROPTDEF const dropt_char*
 dropt_get_error_message(dropt_context* context)
 {
     if (context == NULL)
@@ -699,7 +1707,7 @@ dropt_get_error_message(dropt_context* context)
   *     IN/OUT context : The dropt context to free.
   *                      May be `NULL`.
   */
-void
+DROPTDEF void
 dropt_clear_error(dropt_context* context)
 {
     if (context != NULL)
@@ -734,7 +1742,7 @@ dropt_clear_error(dropt_context* context)
   *       calling `free()` on it when no longer needed.
   *     May return `NULL`.
   */
-dropt_char*
+DROPTDEF dropt_char*
 dropt_default_error_handler(dropt_error error,
                             const dropt_char* optionName,
                             const dropt_char* optionArgument)
@@ -807,7 +1815,7 @@ dropt_default_error_handler(dropt_error error,
   *       responsible for calling `free()` on it when no longer needed.
   *     Returns `NULL` on error.
   */
-dropt_char*
+DROPTDEF dropt_char*
 dropt_get_help(const dropt_context* context,
                const dropt_help_params* helpParams)
 {
@@ -946,7 +1954,7 @@ dropt_get_help(const dropt_context* context,
   *     IN helpParams : The help parameters.
   *                     Pass `NULL` to use the default help parameters.
   */
-void
+DROPTDEF void
 dropt_print_help(FILE* f, const dropt_context* context,
                  const dropt_help_params* helpParams)
 {
@@ -1306,7 +2314,7 @@ exit:
   * RETURNS:
   *     A pointer to the first unprocessed element in `argv`.
   */
-dropt_char**
+DROPTDEF dropt_char**
 dropt_parse(dropt_context* context,
             int argc, dropt_char** argv)
 {
@@ -1410,7 +2418,7 @@ exit:
   *       it with `dropt_free_context` when no longer needed.
   *     Returns `NULL` on error.
   */
-dropt_context*
+DROPTDEF dropt_context*
 dropt_new_context(const dropt_option* options)
 {
     dropt_context* context = NULL;
@@ -1462,7 +2470,7 @@ exit:
   *     IN/OUT context : The dropt context to free.
   *                      May be `NULL`.
   */
-void
+DROPTDEF void
 dropt_free_context(dropt_context* context)
 {
     dropt_clear_error(context);
@@ -1480,7 +2488,7 @@ dropt_free_context(dropt_context* context)
   * RETURNS:
   *     The context's list of option specifications.
   */
-const dropt_option*
+DROPTDEF const dropt_option*
 dropt_get_options(const dropt_context* context)
 {
     if (context == NULL)
@@ -1501,7 +2509,7 @@ dropt_get_options(const dropt_context* context)
   *     OUT helpParams : On output, set to the default help parameters.
   *                      Must not be `NULL`.
   */
-void
+DROPTDEF void
 dropt_init_help_params(dropt_help_params* helpParams)
 {
     if (helpParams == NULL)
@@ -1528,7 +2536,7 @@ dropt_init_help_params(dropt_help_params* helpParams)
   *                      Pass `NULL` to use the default error handler.
   *     IN handlerData : Caller-defined callback data.
   */
-void
+DROPTDEF void
 dropt_set_error_handler(dropt_context* context,
                         dropt_error_handler_func handler,
                         void* handlerData)
@@ -1555,7 +2563,7 @@ dropt_set_error_handler(dropt_context* context,
   *                      Pass `NULL` to use the default string comparison
   *                        function.
   */
-void
+DROPTDEF void
 dropt_set_strncmp(dropt_context* context, dropt_strncmp_func cmp)
 {
     if (context == NULL)
@@ -1584,7 +2592,7 @@ dropt_set_strncmp(dropt_context* context, dropt_strncmp_func cmp)
   *     IN allow       : Pass 1 if concatenated arguments should be allowed,
   *                        0 otherwise.
   */
-void
+DROPTDEF void
 dropt_allow_concatenated_arguments(dropt_context* context, dropt_bool allow)
 {
     if (context == NULL)
@@ -1615,7 +2623,7 @@ dropt_allow_concatenated_arguments(dropt_context* context, dropt_bool allow)
   *                   Must not be `NULL`.
   *     IN line     : The line number where the logical error occurred.
   */
-void
+DROPTDEF void
 dropt_misuse(const char* message, const char* filename, int line)
 {
 #ifdef NDEBUG
@@ -1625,3 +2633,503 @@ dropt_misuse(const char* message, const char* filename, int line)
     abort();
 #endif
 }
+
+/* ===== dropt_handlers.c ===== */
+
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include <float.h>
+#include <errno.h>
+#include <assert.h>
+
+
+
+#define CONCAT(s, t) s ## t
+#define XCONCAT(s, t) CONCAT(s, t)
+
+#define STATIC_ASSERT(cond) \
+  enum { XCONCAT(static_assert_line_,  __LINE__) = 1 / ((cond) != 0) }
+
+#define ABS(x) (((x) < 0) ? -(x) : (x))
+
+#if __STDC_VERSION__ >= 199901L
+    #include <stdbool.h>
+#else
+    typedef enum { false, true } bool;
+#endif
+
+
+/** dropt_handle_bool
+  *
+  *     Stores a boolean value parsed from the given string if possible.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : A string representing a boolean value (0 or 1).
+  *                         If `NULL`, the boolean value is assumed to be true.
+  *     OUT dest          : A `dropt_bool*`.
+  *                         On success, set to the interpreted boolean value.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     dropt_error_none
+  *     dropt_error_unknown
+  *     dropt_error_bad_configuration
+  *     dropt_error_mismatch
+  */
+DROPTDEF dropt_error
+dropt_handle_bool(dropt_context* context,
+                  const dropt_option* option,
+                  const dropt_char* optionArgument,
+                  void* dest)
+{
+    dropt_error err = dropt_error_none;
+    bool val = false;
+    dropt_bool* out = dest;
+
+    if (out == NULL)
+    {
+        DROPT_MISUSE("No handler destination specified.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (optionArgument == NULL)
+    {
+        /* No explicit argument implies that the option is being turned on. */
+        val = true;
+    }
+    else if (optionArgument[0] == DROPT_TEXT_LITERAL('\0'))
+    {
+        err = dropt_error_mismatch;
+    }
+    else
+    {
+        unsigned int i = 0;
+        err = dropt_handle_uint(context, option, optionArgument, &i);
+        if (err == dropt_error_none)
+        {
+            switch (i)
+            {
+                case 0:
+                    val = false;
+                    break;
+                case 1:
+                    val = true;
+                    break;
+                default:
+                    err = dropt_error_mismatch;
+                    break;
+            }
+        }
+        else if (err == dropt_error_overflow)
+        {
+            err = dropt_error_mismatch;
+        }
+    }
+
+    if (err == dropt_error_none) { *out = val; }
+    return err;
+}
+
+
+/** dropt_handle_verbose_bool
+  *
+  *     Like `dropt_handle_bool` but accepts "true" and "false" string values.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : A string representing a boolean value.
+  *                         If `NULL`, the boolean value is assumed to be true.
+  *     OUT dest          : A `dropt_bool*`.
+  *                         On success, set to the interpreted boolean value.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     See dropt_handle_bool.
+  */
+DROPTDEF dropt_error
+dropt_handle_verbose_bool(dropt_context* context,
+                          const dropt_option* option,
+                          const dropt_char* optionArgument,
+                          void* dest)
+{
+    dropt_error err = dropt_handle_bool(context, option, optionArgument, dest);
+    if (err == dropt_error_mismatch)
+    {
+        bool val = false;
+        dropt_bool* out = dest;
+
+        /* `dropt_handle_bool` already checks for this. */
+        assert(out != NULL);
+
+        if (dropt_stricmp(optionArgument, DROPT_TEXT_LITERAL("false")) == 0)
+        {
+            val = false;
+            err = dropt_error_none;
+        }
+        else if (dropt_stricmp(optionArgument, DROPT_TEXT_LITERAL("true")) == 0)
+        {
+            val = true;
+            err = dropt_error_none;
+        }
+
+        if (err == dropt_error_none) { *out = val; }
+    }
+    return err;
+}
+
+
+/** dropt_handle_int
+  *
+  *     Stores an integer parsed from the given string.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : A string representing a base-10 integer.
+  *                         If `NULL`, returns
+  *                           `dropt_error_insufficient_arguments`.
+  *     OUT dest          : An `int*`.
+  *                         On success, set to the interpreted integer.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     dropt_error_none
+  *     dropt_error_unknown
+  *     dropt_error_bad_configuration
+  *     dropt_error_insufficient_arguments
+  *     dropt_error_mismatch
+  *     dropt_error_overflow
+  */
+DROPTDEF dropt_error
+dropt_handle_int(dropt_context* context,
+                 const dropt_option* option,
+                 const dropt_char* optionArgument,
+                 void* dest)
+{
+    dropt_error err = dropt_error_none;
+    int val = 0;
+    int* out = dest;
+
+    if (out == NULL)
+    {
+        DROPT_MISUSE("No handler destination specified.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (   optionArgument == NULL
+             || optionArgument[0] == DROPT_TEXT_LITERAL('\0'))
+    {
+        err = dropt_error_insufficient_arguments;
+    }
+    else
+    {
+        dropt_char* end;
+        long n;
+        errno = 0;
+        n = dropt_strtol(optionArgument, &end, 10);
+
+        /* Check that we matched at least one digit.
+         * (`strtol`/`strtoul` will return 0 if fed a string with no digits.)
+         */
+        if (*end == DROPT_TEXT_LITERAL('\0') && end > optionArgument)
+        {
+            if (errno == ERANGE || n < INT_MIN || n > INT_MAX)
+            {
+                err = dropt_error_overflow;
+                val = (n < 0) ? INT_MIN : INT_MAX;
+            }
+            else if (errno == 0)
+            {
+                val = (int) n;
+            }
+            else
+            {
+                err = dropt_error_unknown;
+            }
+        }
+        else
+        {
+            err = dropt_error_mismatch;
+        }
+    }
+
+    if (err == dropt_error_none) { *out = val; }
+    return err;
+}
+
+
+/** dropt_handle_uint
+  *
+  *     Stores an unsigned integer parsed from the given string.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : A string representing an unsigned base-10 integer.
+  *                         If `NULL`, returns
+  *                           `dropt_error_insufficient_arguments`.
+  *     IN option         : The matched option.  For more information, see
+  *                         dropt_option_handler_decl.
+  *     OUT dest          : An `unsigned int*`.
+  *                         On success, set to the interpreted integer.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     dropt_error_none
+  *     dropt_error_unknown
+  *     dropt_error_bad_configuration
+  *     dropt_error_insufficient_arguments
+  *     dropt_error_mismatch
+  *     dropt_error_overflow
+  */
+DROPTDEF dropt_error
+dropt_handle_uint(dropt_context* context,
+                  const dropt_option* option,
+                  const dropt_char* optionArgument,
+                  void* dest)
+{
+    dropt_error err = dropt_error_none;
+    int val = 0;
+    unsigned int* out = dest;
+
+    if (out == NULL)
+    {
+        DROPT_MISUSE("No handler destination specified.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (   optionArgument == NULL
+             || optionArgument[0] == DROPT_TEXT_LITERAL('\0'))
+    {
+        err = dropt_error_insufficient_arguments;
+    }
+    else if (optionArgument[0] == DROPT_TEXT_LITERAL('-'))
+    {
+        err = dropt_error_mismatch;
+    }
+    else
+    {
+        dropt_char* end;
+        unsigned long n;
+        errno = 0;
+        n = dropt_strtoul(optionArgument, &end, 10);
+
+        /* Check that we matched at least one digit.
+         * (`strtol`/`strtoul` will return 0 if fed a string with no digits.)
+         */
+        if (*end == DROPT_TEXT_LITERAL('\0') && end > optionArgument)
+        {
+            if (errno == ERANGE || n > UINT_MAX)
+            {
+                err = dropt_error_overflow;
+                val = UINT_MAX;
+            }
+            else if (errno == 0)
+            {
+                val = (unsigned int) n;
+            }
+            else
+            {
+                err = dropt_error_unknown;
+            }
+        }
+        else
+        {
+            err = dropt_error_mismatch;
+        }
+    }
+
+    if (err == dropt_error_none) { *out = val; }
+    return err;
+}
+
+
+/** dropt_handle_double
+  *
+  *     Stores a `double` parsed from the given string.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : A string representing a base-10 floating-point
+  *                           number.
+  *                         If `NULL`, returns
+  *                           `dropt_error_insufficient_arguments`.
+  *     OUT dest          : A `double*`.
+  *                         On success, set to the interpreted `double`.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     dropt_error_none
+  *     dropt_error_unknown
+  *     dropt_error_bad_configuration
+  *     dropt_error_insufficient_arguments
+  *     dropt_error_mismatch
+  *     dropt_error_overflow
+  *     dropt_error_underflow
+  */
+DROPTDEF dropt_error
+dropt_handle_double(dropt_context* context,
+                    const dropt_option* option,
+                    const dropt_char* optionArgument,
+                    void* dest)
+{
+    dropt_error err = dropt_error_none;
+    double val = 0.0;
+    double* out = dest;
+
+    if (out == NULL)
+    {
+        DROPT_MISUSE("No handler destination specified.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (   optionArgument == NULL
+             || optionArgument[0] == DROPT_TEXT_LITERAL('\0'))
+    {
+        err = dropt_error_insufficient_arguments;
+    }
+    else
+    {
+        dropt_char* end;
+        errno = 0;
+        val = dropt_strtod(optionArgument, &end);
+
+        /* Check that we matched at least one digit.
+         * (`strtod` will return 0 if fed a string with no digits.)
+         */
+        if (*end == DROPT_TEXT_LITERAL('\0') && end > optionArgument)
+        {
+            if (errno == ERANGE)
+            {
+                /* Note that setting `errno` to `ERANGE` for underflow errors
+                 * is implementation-defined behavior, but glibc, BSD's
+                 * libc, and Microsoft's CRT all have implementations of
+                 * `strtod` documented to return 0 and to set `errno` to
+                 * `ERANGE` for such cases.
+                 */
+                err = (ABS(val) <= DBL_MIN)
+                      ? dropt_error_underflow
+                      : dropt_error_overflow;
+            }
+            else if (errno != 0)
+            {
+                err = dropt_error_unknown;
+            }
+        }
+        else
+        {
+            err = dropt_error_mismatch;
+        }
+    }
+
+    if (err == dropt_error_none) { *out = val; }
+    return err;
+}
+
+
+/** dropt_handle_string
+  *
+  *     Stores a string.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : A string.
+  *                         If `NULL`, returns
+  *                           `dropt_error_insufficient_arguments`.
+  *     OUT dest          : A `dropt_char**`.
+  *                         On success, set to the input string.  The string is
+  *                           NOT copied from the original `argv` array, so do
+  *                           not free it.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     dropt_error_none
+  *     dropt_error_bad_configuration
+  *     dropt_error_insufficient_arguments
+  */
+DROPTDEF dropt_error
+dropt_handle_string(dropt_context* context,
+                    const dropt_option* option,
+                    const dropt_char* optionArgument,
+                    void* dest)
+{
+    dropt_error err = dropt_error_none;
+    const dropt_char** out = dest;
+
+    if (out == NULL)
+    {
+        DROPT_MISUSE("No handler destination specified.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (optionArgument == NULL)
+    {
+        err = dropt_error_insufficient_arguments;
+    }
+
+    if (err == dropt_error_none) { *out = optionArgument; }
+    return err;
+}
+
+
+/** dropt_handle_const
+  *
+  *     Stores a predefined value.  This can be used to set a single variable
+  *     to different values in response to different boolean-like command-line
+  *     options.
+  *
+  * PARAMETERS:
+  *     IN/OUT context    : The options context.
+  *     IN option         : The matched option.  For more information, see
+  *                         `dropt_option_handler_decl`.
+  *     IN optionArgument : Must be `NULL`.
+  *     OUT dest          : A `dropt_uintptr*`.
+  *                         On success, set to the constant value specified by
+  *                           `option->extra_data`.
+  *                         On error, left untouched.
+  *
+  * RETURNS:
+  *     dropt_error_none
+  *     dropt_error_bad_configuration
+  *     dropt_error_mismatch
+  */
+
+DROPTDEF dropt_error
+dropt_handle_const(dropt_context* context,
+                   const dropt_option* option,
+                   const dropt_char* optionArgument,
+                   void* dest)
+{
+    dropt_error err = dropt_error_none;
+    dropt_uintptr* out = dest;
+
+    STATIC_ASSERT(sizeof (dropt_uintptr) >= sizeof (void*));
+
+    if (out == NULL)
+    {
+        DROPT_MISUSE("No handler destination specified.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (option == NULL)
+    {
+        DROPT_MISUSE("No option entry given.");
+        err = dropt_error_bad_configuration;
+    }
+    else if (optionArgument != NULL)
+    {
+        err = dropt_error_mismatch;
+    }
+
+    if (err == dropt_error_none) { *out = option->extra_data; }
+    return err;
+}
+
+#endif /* DROPT_IMPLEMENTATION_INCLUDED */
+#endif /* DROPT_IMPLEMENTATION */

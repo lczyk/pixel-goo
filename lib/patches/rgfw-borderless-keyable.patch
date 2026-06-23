@@ -1,0 +1,59 @@
+--- a/lib/RGFW.h
++++ b/lib/RGFW.h
+@@ -13133,6 +13141,13 @@
+ static bool RGFW__osxAcceptsFirstResponder(void) { return true; }
+ static bool RGFW__osxPerformKeyEquivalent(id event) { RGFW_UNUSED(event); return true; }
+ 
++/* pixel-goo local patch: accept the activating click. When the app is inactive
++ * (same-space --no-keyfocus-steal cover, launched from another monitor/Space),
++ * the first click on the window normally only activates the app and is swallowed,
++ * so the view doesn't become first responder and esc is dead until a second click.
++ * Returning YES makes the first click count, so one click grabs key focus + esc. */
++static BOOL RGFW__osxAcceptsFirstMouse(id self, SEL _cmd, id event) { RGFW_UNUSED(self); RGFW_UNUSED(_cmd); RGFW_UNUSED(event); return YES; }
++
+ static NSDragOperation RGFW__osxDraggingEntered(id self, SEL sel, id sender) {
+ 	RGFW_UNUSED(sel);
+ 
+@@ -13331,6 +13346,10 @@
+ 	object_getInstanceVariable(self, "RGFW_window", (void**)&win);
+ 	if (win == NULL) return;
+ 
++	/* pixel-goo local patch: route keyDown to the view as soon as the window is key,
++	 * so esc works on the first activating click rather than needing a second one. */
++	((void(*)(id, SEL, id))objc_msgSend)((id)win->src.window, sel_registerName("makeFirstResponder:"), (id)win->src.view);
++
+ 	RGFW_windowFocusCallback(win, RGFW_TRUE);
+ }
+ 
+@@ -13397,6 +13416,13 @@
+ 
+ static BOOL RGFW__osxWantsUpdateLayer(id self, SEL _cmd) { RGFW_UNUSED(self); RGFW_UNUSED(_cmd); return YES; }
+ 
++/* pixel-goo local patch: a borderless NSWindow returns canBecomeKeyWindow = NO
++ * by default, so a same-space borderless cover (--no-keyfocus-steal) can never be
++ * clicked into key focus -> esc-to-quit dead even after clicking it. Override to
++ * YES so a click makes it key and keyDown starts flowing. Harmless for bordered
++ * windows (already YES). */
++static BOOL RGFW__osxCanBecomeKeyWindow(id self, SEL _cmd) { RGFW_UNUSED(self); RGFW_UNUSED(_cmd); return YES; }
++
+ static void RGFW__osxUpdateLayer(id self, SEL _cmd) {
+ 	RGFW_UNUSED(self); RGFW_UNUSED(_cmd);
+ 	RGFW_window* win = NULL;
+@@ -13768,6 +13794,9 @@
+ 	class_addMethod(objc_getClass("NSWindowClass"), sel_registerName("acceptsFirstResponder:"), (IMP)(void*)RGFW__osxAcceptsFirstResponder, 0);
+ 	class_addMethod(objc_getClass("NSWindowClass"), sel_registerName("performKeyEquivalent:"), (IMP)(void*)RGFW__osxPerformKeyEquivalent, 0);
+ 
++	/* pixel-goo local patch: let borderless windows become key (see fn comment). */
++	class_replaceMethod(objc_getClass("NSWindow"), sel_registerName("canBecomeKeyWindow"), (IMP)RGFW__osxCanBecomeKeyWindow, "B@:");
++
+ 	_RGFW->NSApp = objc_msgSend_id(objc_getClass("NSApplication"), sel_registerName("sharedApplication"));
+ 
+ 	NSRetain(_RGFW->NSApp);
+@@ -13804,6 +13833,7 @@
+ 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("mouseExited:"), (IMP)RGFW__osxMouseExited, "v@:@");
+ 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("flagsChanged:"), (IMP)RGFW__osxFlagsChanged, "v@:@");
+ 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_getUid("acceptsFirstResponder"), (IMP)RGFW__osxAcceptsFirstResponder, "B@:");
++		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("acceptsFirstMouse:"), (IMP)RGFW__osxAcceptsFirstMouse, "B@:@");
+ 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("initWithRGFWWindow:"), (IMP)RGFW__osxCustomInitWithRGFWWindow, "@@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+ 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("wantsUpdateLayer"), (IMP)RGFW__osxWantsUpdateLayer, "B@:");
+ 		class_addMethod((Class)_RGFW->customViewClasses[i], sel_registerName("updateLayer"), (IMP)RGFW__osxUpdateLayer, "v@:");

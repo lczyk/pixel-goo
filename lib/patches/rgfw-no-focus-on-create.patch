@@ -1,0 +1,36 @@
+--- a/lib/RGFW.h
++++ b/lib/RGFW.h
+@@ -922,6 +922,7 @@
+ 	RGFW_windowOpenGL = RGFW_BIT(17), /*!< create an OpenGL context (you can also do this manually with RGFW_window_createContext_OpenGL) */
+ 	RGFW_windowEGL = RGFW_BIT(18), /*!< create an EGL context (you can also do this manually with RGFW_window_createContext_EGL) */
+ 	RGFW_noDeinitOnClose = RGFW_BIT(19), /*!< do not auto deinit RGFW if the window closes and this is the last window open */
++	RGFW_windowNoFocusOnCreate = RGFW_BIT(20), /*!< show the window without activating the app or stealing key focus (macOS) */
+ 	RGFW_windowedFullscreen = RGFW_windowNoBorder | RGFW_windowMaximize,
+ 	RGFW_windowCaptureRawMouse = RGFW_windowCaptureMouse | RGFW_windowRawMouse
+ };
+@@ -13909,14 +13943,19 @@
+ 		NSColor_colorWithSRGB(0, 0, 0, 0));
+ 	}
+ 
+-	/* Show the window */
+-	objc_msgSend_void_bool((id)_RGFW->NSApp, sel_registerName("activateIgnoringOtherApps:"), true);
++	/* Show the window. RGFW_windowNoFocusOnCreate orders it front without activating
++	 * the app or making it key, so it doesn't steal keyboard focus (e.g. benchmarks). */
++	if (flags & RGFW_windowNoFocusOnCreate) {
++		((id(*)(id, SEL, SEL))objc_msgSend)((id)win->src.window, sel_registerName("orderFront:"), NULL);
++	} else {
++		objc_msgSend_void_bool((id)_RGFW->NSApp, sel_registerName("activateIgnoringOtherApps:"), true);
+ 
+-	if (_RGFW->root == NULL) {
+-		objc_msgSend_void(win->src.window, sel_registerName("makeMainWindow"));
+-	}
++		if (_RGFW->root == NULL) {
++			objc_msgSend_void(win->src.window, sel_registerName("makeMainWindow"));
++		}
+ 
+-	objc_msgSend_void(win->src.window, sel_registerName("makeKeyWindow"));
++		objc_msgSend_void(win->src.window, sel_registerName("makeKeyWindow"));
++	}
+ 
+ 	NSRetain(win->src.window);
+ 

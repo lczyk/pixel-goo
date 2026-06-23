@@ -1,0 +1,41 @@
+--- a/lib/RGFW.h
++++ b/lib/RGFW.h
+@@ -2051,6 +2052,13 @@
+ RGFWDEF void RGFW_window_setFloating(RGFW_window* win, RGFW_bool floating);
+ 
+ /**!
++ * @brief pixel-goo local patch: cover the whole display in the current Space
++ *        (no native fullscreen Space, so no key-focus steal). macos only.
++ * @param win a pointer to the target window
++*/
++RGFWDEF void RGFW_window_coverDisplay(RGFW_window* win);
++
++/**!
+  * @brief sets the opacity level of the window
+  * @param win a pointer to the target window
+  * @param opacity the opacity level (0–255)
+@@ -14163,6 +14204,24 @@
+     else 		  objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), kCGNormalWindowLevelKey);
+ }
+ 
++/* pixel-goo local patch: cover the whole display in the *current* Space (no
++ * native fullscreen Space, hence no focus steal). Raises the window above the
++ * menu bar (NSStatusWindowLevel = 25, > kCGMainMenuWindowLevel = 24) and sizes
++ * it to the screen's full frame. macos only; used by --no-keyfocus-steal. */
++void RGFW_window_coverDisplay(RGFW_window* win) {
++	RGFW_ASSERT(win != NULL);
++	id screen = objc_msgSend_id((id)win->src.window, sel_registerName("screen"));
++	NSRect r = ((NSRect(*)(id, SEL))abi_objc_msgSend_stret)(screen, sel_registerName("frame"));
++	objc_msgSend_void_id(win->src.window, sel_registerName("setLevel:"), (void*)(intptr_t)25);
++	((void(*)(id, SEL, NSRect))objc_msgSend)
++		((id)win->src.view, sel_registerName("setFrame:"), (NSRect){{0, 0}, r.size});
++	((void(*)(id, SEL, NSRect, bool, bool))objc_msgSend)
++		((id)win->src.window, sel_registerName("setFrame:display:animate:"), r, true, false);
++	((id(*)(id, SEL, SEL))objc_msgSend)((id)win->src.window, sel_registerName("orderFront:"), (SEL)NULL);
++	win->x = (i32)r.origin.x; win->y = (i32)r.origin.y;
++	win->w = (i32)r.size.width; win->h = (i32)r.size.height;
++}
++
+ void RGFW_window_setOpacity(RGFW_window* win, u8 opacity) {
+ 	objc_msgSend_int(win->src.window, sel_registerName("setAlphaValue:"), opacity);
+ 	objc_msgSend_void_bool(win->src.window, sel_registerName("setOpaque:"), (opacity < (u8)255));

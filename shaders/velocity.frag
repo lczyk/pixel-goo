@@ -57,7 +57,7 @@ vec2 textureVDI(sampler2D textureSampler, vec2 position, float radius, float nea
 
     // Value of the integral
     vec2 integral = vec2(0,0);
-    
+
     // A pile of static values pulled out of the loop
     float invN2 = 1/(N * N); // inverse of N^2
     float phase_multiplier = (1/radius) * PI * random_float(0 + VertexID + epoch_counter); // Static random value (-pi,pi) divided by the radius
@@ -188,10 +188,7 @@ void main() {
 #ifdef MOUSE_REPELL
     // if (!inmouseradius) {
 #endif /* MOUSE_REPELL */
-        // vec2 density_integral = textureVDI(density_buffer, position, 30, 10, 100);
-        // vec2 density_integral = textureVDI(density_buffer, position, 20, 2, 100);
         vec2 density_integral = textureVDI(density_buffer, position, 20, 2, 20);
-        // vec2 density_integral = textureVDI(density_buffer, position, 20, 2, 100);
         // new_velocity -= 0.01 * density_integral;
         new_velocity -= 0.04 * density_integral;
         // new_velocity -= (1-density) * 0.02 * density_integral;
@@ -204,10 +201,7 @@ void main() {
 #ifdef MOUSE_REPELL
     if (!inmouseradius) {
 #endif /* MOUSE_REPELL */
-        // vec2 trail_integral = textureVWI(trail_buffer, position, velocity, PI*0.5, 50, 20, 100);
-        // vec2 trail_integral = textureVWI(trail_buffer, position, velocity, PI*0.6, 30, 10, 100);
         vec2 trail_integral = textureVWI(trail_buffer, position, velocity, PI*0.6, 30, 10, 20);
-        // vec2 trail_integral = textureVWI(trail_buffer, position, velocity, PI*0.5, 30, 10, 100);
         // new_velocity += 0.07 * trail_integral;
         // new_velocity += clamp(1-density,0.2,1.0) * 0.05 * trail_integral;
         new_velocity += clamp((1-(density * density * density)), 0.8, 1) * 0.07 * trail_integral;
