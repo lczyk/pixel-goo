@@ -15,3 +15,4 @@ nob.old
 
 # rendered output (--headless)
 *.mp4
+*.gif
