@@ -245,6 +245,9 @@ static void dump_ppm_rgb(const char *path, int w, int h, GLuint fbo)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
     unsigned char *px = (unsigned char *)malloc((size_t)w * h * 3);
+    // tightly-packed rgb24: default GL_PACK_ALIGNMENT=4 pads rows when w*3 % 4 != 0
+    // (e.g. w=125 -> 375), shearing the readback. force byte packing.
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
     glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
     FILE *f = fopen(path, "wb");
     if (f) {
@@ -846,10 +849,17 @@ int main(int argc, char **argv)
     if (headless_path)
     {
         int fr = fps_cap > 0 ? fps_cap : 60;
+        // Upscale render-res -> logical size with nearest-neighbour, mirroring the
+        // window's GL_NEAREST upscale, so pixels stay crisp instead of the player
+        // bilinear-blurring the tiny frame. Even dims for yuv420p; -crf 18 keeps
+        // compression blur down.
+        int outw = (int)lround(width * render_scale);  outw -= outw & 1;
+        int outh = (int)lround(height * render_scale); outh -= outh & 1;
         char cmd[1280];
         snprintf(cmd, sizeof cmd,
-                 "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - -vf vflip \"%s\"",
-                 width, height, fr, headless_path);
+                 "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
+                 "-vf vflip,scale=%d:%d:flags=neighbor -pix_fmt yuv420p -crf 18 \"%s\"",
+                 width, height, fr, outw, outh, headless_path);
         ffmpeg_pipe = popen(cmd, "w");
         if (!ffmpeg_pipe)
         {
@@ -1003,6 +1013,9 @@ int main(int argc, char **argv)
         if (headless_path)
         {
             glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[renderBuffer.current]);
+            // tightly-packed rgb24: default GL_PACK_ALIGNMENT=4 pads rows when width*3 % 4
+            // != 0 (e.g. 125 -> 375), shearing the frame. force byte packing.
+            glPixelStorei(GL_PACK_ALIGNMENT, 1);
             glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, headless_px);
             glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
             fwrite(headless_px, 1, (size_t)width * height * 3, ffmpeg_pipe);
