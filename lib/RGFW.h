@@ -14944,6 +14944,11 @@ void* RGFW_getCurrentContext_OpenGL(void) {
 
 void RGFW_window_swapBuffers_OpenGL(RGFW_window* win) {
 	RGFW_ASSERT(win && win->src.ctx.native);
+	/* Validate the drawable against the current view geometry before flushing. cocoa does
+	 * NOT auto-grow a raw NSOpenGLContext's surface when the window moves to a monitor of a
+	 * different backing scale (retina vs not) -- leaving the drawable the old size while the
+	 * viewport is the new size (partial render). [update] is a no-op when geometry is stable. */
+	objc_msgSend_void(win->src.ctx.native->ctx, sel_registerName("update"));
 	objc_msgSend_void(win->src.ctx.native->ctx, sel_registerName("flushBuffer"));
 }
 void RGFW_window_swapInterval_OpenGL(RGFW_window* win, i32 swapInterval) {

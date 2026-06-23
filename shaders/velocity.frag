@@ -43,6 +43,12 @@ float modFloat(float x, float y) {
     return x - y * floor(x/y);
 }
 
+// The density buffer is now accumulated ADDITIVELY (unbounded). Tone-map it back to the
+// [0,1] range the physics expects: 1-exp(-d) reproduces the old saturating field
+// (1-(1-a)^n) to high precision, so the dynamics are ~unchanged. Apply on every density
+// read (the scalar below + each disc-integral sample), but NOT to the trail field.
+float tmap(float d) { return 1.0 - exp(-d); }
+
 // Textures are smaples from the *bottom* left corner, and in normalised coordinates
 vec2 textureNormalisedCoords(vec2 coordinate) {
     coordinate = mod(coordinate, window_shape);
@@ -79,7 +85,7 @@ vec2 textureVDI(sampler2D textureSampler, vec2 position, float radius, float nea
 
         // Relative coordinate of the sample
         vec2 sample_xy = r * vec2(cos(theta), sin(theta));
-        float sample = texture(textureSampler, textureNormalisedCoords(position + sample_xy)).x;
+        float sample = tmap(texture(textureSampler, textureNormalisedCoords(position + sample_xy)).x); // tmap: density is additive/unbounded
 
         // Final check to make sure no nonsence is added to the integral
         if (isnan(sample) || isinf(sample)) { sample = 0; }
@@ -161,7 +167,7 @@ void main() {
     ivec2 buffer_position = ivec2(gl_FragCoord.xy);
     vec2 position = vec2(texelFetch(position_buffer, buffer_position, 0)); // current position
     vec2 velocity = vec2(texelFetch(velocity_buffer, buffer_position, 0)); // previous velocity
-    float density = texture(density_buffer, textureNormalisedCoords(position)).x;
+    float density = tmap(texture(density_buffer, textureNormalisedCoords(position)).x); // tmap: density is additive/unbounded
 
     vec2 new_velocity = velocity;
 

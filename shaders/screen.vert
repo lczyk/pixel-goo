@@ -1,9 +1,7 @@
 #version 330 core
 
 uniform vec2 window_shape;
-uniform sampler2D density_buffer;
-uniform float cull_from; // density where culling begins (--cull-from)
-uniform float cull_max;  // ceiling on cull fraction, < 1 keeps cores populated (--cull-max)
+uniform float cull_amount; // fraction of particles culled, uniformly (--cull)
 
 // Position/velocity streamed from PBOs as attributes (no vertex texture fetch).
 layout(location = 0) in vec2 a_position;
@@ -24,16 +22,12 @@ vec2 screenNormalisedCoords(vec2 coordinate) {
 void main() {
     velocity = length(a_velocity);
 
-    // Stochastic density cull, pre-binning (pushed offscreen -> clipped before the
-    // tiler bins it, shrinking the dense/expensive tiles). Cull probability ramps from 0
-    // at cull_from density to cull_max at full density; compared against a fixed-per-
-    // particle random so the decision is stable (no per-frame flicker). Nothing below
-    // cull_from is culled (no gaps in sparse/mid regions); cull_max < 1 keeps the densest
-    // cores populated (no holes).
-    float density = texture(density_buffer, mod(a_position, window_shape)/window_shape).x;
-    float cull_prob = cull_max * smoothstep(cull_from, 1.0, density);
-    if (cull_prob > random(3.0 + float(gl_VertexID))) {
-        gl_Position = vec4(2.0, 2.0, 2.0, 1.0); // outside clip space -> never binned
+    // Uniform stable cull: keep iff the particle's fixed random > cull_amount. It's
+    // density-independent, so the culled set is identical every frame -> cannot flicker
+    // (unlike the old density-driven cull, which popped as the live density jittered).
+    // culled points go offscreen -> clipped before the tiler ever bins them.
+    if (random(3.0 + float(gl_VertexID)) < cull_amount) {
+        gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         return;
     }
 

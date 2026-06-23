@@ -6,6 +6,14 @@ layout(pixel_center_integer) in vec4 gl_FragCoord;
 uniform sampler2D density_buffer;
 uniform vec2 window_shape;
 
+// Density is additive/unbounded. The colormap normalises by render_headroom (auto-tracked
+// to the live density max -> the brightest region lands just under 1.0, no clipping) then
+// applies a gamma: render_gamma = 1 is linear (punchy, high contrast like the old clipped
+// look); < 1 lifts the faint regions (a softer compressor). It's a compressor with auto
+// makeup gain -- contrast without the clipping.
+uniform float render_headroom;
+uniform float render_gamma;
+
 in float velocity;
 
 // Colormaps courtesy of https://www.shadertoy.com/view/WlfXRN
@@ -77,9 +85,8 @@ void main() {
     // so no discard here -- only points that survived the cull ever reach this stage.
 
     float alpha = clamp(velocity,0.0,1.0);
-    // float colormap_sampler = 0.5*density+0.5;
-    float colormap_sampler = density;
-    colormap_sampler = mix(colormap_sampler,colormap_sampler*colormap_sampler*colormap_sampler,colormap_sampler);
+    // normalise by the (auto) headroom, then gamma. linear (gamma 1) = punchy; <1 lifts faint.
+    float colormap_sampler = pow(clamp(density / render_headroom, 0.0, 1.0), render_gamma);
     // colormap_sampler = 1-(1-colormap_sampler)*(1-colormap_sampler);
     // colormap_sampler = colormap_sampler*colormap_sampler*colormap_sampler;
     // colormap_sampler = clamp(colormap_sampler,0.05,0.9);

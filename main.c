@@ -40,7 +40,11 @@ bool fullscreen = true;
 bool vsync = true;
 bool profile = false; // --profile: glFinish per pass + print ms (disables pipelining)
 int max_iterations = 0; // -N: exit after N loop iterations (0 = unlimited); for benchmarking
+int fps_cap = 60;       // --fps-cap: throttle the average fps to this (0 = uncapped)
 bool no_keyfocus_steal = false; // --no-keyfocus-steal: show window w/out grabbing key focus
+bool no_mouse = false;          // --no-mouse: disable the mouse repel (park the cursor far off)
+char *dump_path = NULL; // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
+int rng_seed = 0;       // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
 int whichMonitor = 0;
 // int whichMonitor = 1;
 
@@ -56,12 +60,11 @@ const PBindex trailBufferIndex1 = 5;
 const PBindex trailBufferIndex2 = 6;
 const PBindex renderBufferIndex = 7; // internal colour target, upscaled to the window
 
-GLuint vertex_buffer;
-
 // Physics buffer dims (square-ish texture holding P particles), set in buffer_setup.
 int PB_width = 0;
 int PB_height = 0;
-// PBOs for the texture->VBO readback experiment (position/velocity as attributes).
+// PBOs holding position/velocity: filled each frame by glReadPixels(FBO->PBO) and bound
+// as vertex attributes for the point passes (faster than vertex texture fetch on this gpu).
 GLuint pbo_pos = 0;
 GLuint pbo_vel = 0;
 
@@ -105,17 +108,32 @@ int trailSubsample = 2;   // --trail-sub
 int dens_every = 3;       // --dens-every: rebuild density field every N frames (reuse between)
 int trail_every = 2;      // --trail-every: deposit a rotating 1/N trail subset per frame (decay every frame)
 
-// Screen render: stochastic density cull amount (--cull), 0 = off, 1 = max. Higher thins
-// more of the denser regions. Drives the shader's cull ramp: thinning starts at density
-// (1 - cull) and rises to CULL_CEIL at full density, compared against a fixed-per-particle
-// random (stable -> no flicker). The ceiling stays < 1 so dense cores keep some points
-// (no holes). Purely visual -- only thins the screen point pass, not the physics.
-double cullAmount = 0.35; // --cull
-#define CULL_CEIL 0.90f   // max cull fraction at peak density (keeps cores populated)
+// Screen render: uniform cull (--cull), 0 = off .. 1 = all. Drops that fraction of particles
+// by a fixed per-particle random -- density-independent, so the culled set is identical every
+// frame and cannot flicker. Purely a perf/thinning knob; only thins the screen point pass, not
+// the physics. (The dense-core look is handled by the additive-density + tonemap render, not
+// by culling, so this defaults off.)
+double cullAmount = 0.0; // --cull
 
-// This can be quite a lot because the density buffer is lerped and particles dither
-// const int densityBufferDownsampling = 10;
-const int densityBufferDownsampling = 20;
+// Screen colormap: density is additive/unbounded; the render log-maps it (a compressor),
+// and the headroom is the makeup gain. By default it AUTO-tracks the live density max with
+// an EMA (an envelope follower), so the brightest region always lands just under clipping
+// regardless of particle count / cluster state -- auto-exposure. --headroom overrides with
+// a fixed value (disables auto); --headroom-margin scales the tracked max (>1 = darker /
+// more headroom, <1 = brighter / some clip); --headroom-attack is the EMA speed.
+double renderHeadroom = 0.0;     // --headroom: fixed value (0 = auto-track)
+double headroomMargin = 1.15;    // --headroom-margin: tracked-max multiplier
+double headroomAttack = 0.05;    // --headroom-attack: EMA alpha for the max follower
+double renderGamma = 0.6;        // --gamma: colormap curve (1 = linear/punchy, <1 lifts faint)
+bool densityNearest = false;     // --density-nearest: GL_NEAREST density (chunky pixels) vs default GL_LINEAR
+double headroomPct = 0.98;       // --headroom-pct: track this density percentile, not the max
+                                 // (1.0 = max; <1 ignores outlier hot-spots so the network gets the bright range)
+float headroom_ema = 0.0f;       // running EMA of the density max (the auto headroom)
+float *density_readback = NULL;  // CPU scratch for reading the density buffer back
+
+// Buffer resolution divisor: the density field is render-res / this. Can be high because
+// the field is lerped and particles dither into it. --dens-downsample.
+int densityBufferDownsampling = 20;
 int density_width = 0;  // computed in buffer_setup once width/height are final
 int density_height = 0;
 
@@ -128,8 +146,7 @@ const float trailIntensity = 0.06f;
 const float trailAlpha = 0.85f;
 // const float trailAlpha = 0.90f;
 const float trailRadius = 15.0f;
-const int trailBufferDownsampling = 10;
-// const int trailBufferDownsampling = 20;
+int trailBufferDownsampling = 10; // trail field resolution = render-res / this. --trail-downsample.
 const float trailVelocityFloor = 0.6;
 int trail_width = 0;
 int trail_height = 0;
@@ -158,6 +175,17 @@ static double get_time()
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
+// Sleep for ms milliseconds (frame pacing). <=0 returns immediately.
+static void sleep_ms(double ms)
+{
+    if (ms <= 0.0) return;
+    struct timespec req = {
+        .tv_sec = (time_t)(ms / 1000.0),
+        .tv_nsec = (long)(fmod(ms, 1000.0) * 1e6),
+    };
+    nanosleep(&req, NULL);
+}
+
 // Uniform random float in [0, 1]; replaces glm::linearRand
 static float frand01()
 {
@@ -168,6 +196,56 @@ static float frand01()
 static double ema(double prev, double sample, double a)
 {
     return prev == 0.0 ? sample : a * sample + (1.0 - a) * prev;
+}
+
+// Ascending float compare, for the auto-headroom percentile (qsort over the tiny density buffer).
+static int cmp_float(const void *a, const void *b)
+{
+    float fa = *(const float *)a, fb = *(const float *)b;
+    return (fa > fb) - (fa < fb);
+}
+
+// Debug dump tooling (--dump). Read a framebuffer back and write it as a PPM so it can be
+// eyeballed as an image. glReadPixels is bottom-up, so flip to top-down on write.
+static void dump_ppm_rgb(const char *path, int w, int h, GLuint fbo)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    unsigned char *px = (unsigned char *)malloc((size_t)w * h * 3);
+    glReadPixels(0, 0, w, h, GL_RGB, GL_UNSIGNED_BYTE, px);
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; y--) fwrite(px + (size_t)y * w * 3, 1, (size_t)w * 3, f);
+        fclose(f);
+        fprintf(stdout, "dumped %s\n", path);
+    }
+    free(px);
+}
+
+// Single-channel R32F field -> grayscale PPM, normalised by its own max (printed too, so
+// the actual value range is visible -- important once density goes unbounded/additive).
+static void dump_ppm_scalar(const char *path, int w, int h, GLuint fbo)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
+    float *v = (float *)malloc((size_t)w * h * sizeof(float));
+    glReadPixels(0, 0, w, h, GL_RED, GL_FLOAT, v);
+    float mx = 0.0f;
+    for (size_t i = 0; i < (size_t)w * h; i++) if (v[i] > mx) mx = v[i];
+    float norm = mx > 0.0f ? mx : 1.0f;
+    unsigned char *px = (unsigned char *)malloc((size_t)w * h);
+    for (size_t i = 0; i < (size_t)w * h; i++) {
+        float t = v[i] / norm;
+        px[i] = (unsigned char)(255.0f * (t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t)));
+    }
+    FILE *f = fopen(path, "wb");
+    if (f) {
+        fprintf(f, "P5\n%d %d\n255\n", w, h);
+        for (int y = h - 1; y >= 0; y--) fwrite(px + (size_t)y * w, 1, (size_t)w, f);
+        fclose(f);
+        fprintf(stdout, "dumped %s (max value %.4f)\n", path, mx);
+    }
+    free(px);
+    free(v);
 }
 
 // Tile-coherent draw order. The screen pass binds the goo's scattered points into
@@ -257,6 +335,8 @@ static void parse_args(int argc, char **argv)
     dropt_bool no_vsync = 0;
     dropt_bool prof = 0;
     dropt_bool no_focus = 0;
+    dropt_bool dens_near = 0;
+    dropt_bool nomouse = 0;
 
     dropt_option options[] = {
         {'h', "help", "Show this help and exit.", NULL,
@@ -277,22 +357,46 @@ static void parse_args(int argc, char **argv)
          dropt_handle_bool, &prof},
         {'N', "iterations", "Exit after N loop iterations (0 = unlimited); for benchmarking.", "N",
          dropt_handle_int, &max_iterations},
+        {'\0', "fps-cap", "Throttle the average frame rate to N fps (0 = uncapped).", "N",
+         dropt_handle_int, &fps_cap},
         {'\0', "sort-every", "Rebuild tile-coherent draw order every N frames (0 = never).", "N",
          dropt_handle_int, &sort_every},
         {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
          dropt_handle_bool, &no_focus},
+        {'\0', "no-mouse", "Disable the mouse repel interaction.", NULL,
+         dropt_handle_bool, &nomouse},
         {'\0', "dens-sub", "Density buffer: scatter every Nth particle (higher = less overdraw).", "N",
          dropt_handle_int, &densitySubsample},
         {'\0', "trail-sub", "Trail buffer: scatter every Nth particle (higher = less overdraw).", "N",
          dropt_handle_int, &trailSubsample},
+        {'\0', "dens-downsample", "Density field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
+         dropt_handle_int, &densityBufferDownsampling},
+        {'\0', "trail-downsample", "Trail field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
+         dropt_handle_int, &trailBufferDownsampling},
         {'\0', "cull", "Screen density cull amount, 0 = off .. 1 = max (thins denser regions).", "F",
          dropt_handle_double, &cullAmount},
+        {'\0', "headroom", "Fixed colormap headroom (0 = auto-track the density max).", "F",
+         dropt_handle_double, &renderHeadroom},
+        {'\0', "headroom-margin", "Auto-headroom: multiplier on the tracked max (>1 darker, <1 brighter).", "F",
+         dropt_handle_double, &headroomMargin},
+        {'\0', "headroom-attack", "Auto-headroom: EMA speed of the max follower (0..1).", "F",
+         dropt_handle_double, &headroomAttack},
+        {'\0', "gamma", "Colormap curve: 1 = linear/punchy, <1 lifts faint regions.", "F",
+         dropt_handle_double, &renderGamma},
+        {'\0', "density-nearest", "Sample the density field with GL_NEAREST (chunky pixels) instead of GL_LINEAR.", NULL,
+         dropt_handle_bool, &dens_near},
+        {'\0', "headroom-pct", "Auto-headroom: track this density percentile (1 = max; <1 ignores hot-spots).", "F",
+         dropt_handle_double, &headroomPct},
         {'\0', "dens-every", "Rebuild the density field every N frames (reuse between; cheaper).", "N",
          dropt_handle_int, &dens_every},
         {'\0', "trail-every", "Update the trail field every N frames (decay/deposit compensated).", "N",
          dropt_handle_int, &trail_every},
         {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier).", "N",
          dropt_handle_double, &render_scale},
+        {'\0', "seed", "Fixed RNG seed for reproducible runs (0 = time-based).", "N",
+         dropt_handle_int, &rng_seed},
+        {'\0', "dump", "Debug: at exit, write frame + density + trail to <prefix>_*.ppm.", "PREFIX",
+         dropt_handle_string, &dump_path},
         {0} // sentinel
     };
 
@@ -327,6 +431,8 @@ static void parse_args(int argc, char **argv)
     if (no_vsync) vsync = false;
     if (prof) profile = true;
     if (no_focus) no_keyfocus_steal = true;
+    if (dens_near) densityNearest = true;
+    if (nomouse) no_mouse = true;
 
     // Guard against values that would crash or hang the sim.
     if (P < 1)
@@ -342,6 +448,16 @@ static void parse_args(int argc, char **argv)
     if (render_scale < 1.0)
     {
         fprintf(stderr, "goo: --render-scale must be >= 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (densityBufferDownsampling < 1 || trailBufferDownsampling < 1)
+    {
+        fprintf(stderr, "goo: --dens-downsample/--trail-downsample must be >= 1\n");
+        exit(EXIT_FAILURE);
+    }
+    if (densitySubsample < 1 || trailSubsample < 1)
+    {
+        fprintf(stderr, "goo: --dens-sub/--trail-sub must be >= 1\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -366,9 +482,9 @@ int main(int argc, char **argv)
 
     // Write uniforms to shaders
     shader_set_uniform_int(&screenShader, "density_buffer", densityBuffer.current);
-    // Single --cull knob -> shader ramp: thinning starts at density (1 - cull), capped.
-    shader_set_uniform_float(&screenShader, "cull_from", (float)(1.0 - cullAmount));
-    shader_set_uniform_float(&screenShader, "cull_max", CULL_CEIL);
+    shader_set_uniform_float(&screenShader, "cull_amount", (float)cullAmount);
+    shader_set_uniform_float(&screenShader, "render_headroom", (float)renderHeadroom);
+    shader_set_uniform_float(&screenShader, "render_gamma", (float)renderGamma);
     shader_set_uniform_int(&densityShader, "density_buffer_downsampling", densityBufferDownsampling);
     shader_set_uniform_float(&densityShader, "density_alpha", densityAlpha * densitySubsample);
     shader_set_uniform_float(&densityShader, "kernel_radius", kernelRadius);
@@ -409,6 +525,7 @@ int main(int argc, char **argv)
     // profiling, so --no-vsync shows real fps without the serialisation penalty.
     double frame_prev = get_time();
     double frame_ms = 0.0;
+    double fps_sleep_ms = 0.0; // --fps-cap pacing: slack we sleep each frame
 
     //======================================
     //
@@ -424,9 +541,25 @@ int main(int argc, char **argv)
     {
         if (max_iterations > 0 && epoch_counter >= max_iterations) break;
 
-        // Poll mouse position
-        RGFW_window_getMouse(window, &xpos, &ypos);
-        float mouse_position[] = {(float)xpos * mouse_scale, (float)ypos * mouse_scale};
+        // Keep the upscale target synced to the actual device-px framebuffer. It changes
+        // when the window moves between monitors of different dpi (retina vs not), which
+        // does not reliably fire a resize event -- so poll it (cheap; reconfig only on
+        // change). Without this the viewport is stale -> black, or the bottom-left quadrant.
+        {
+            i32 fbw = 0, fbh = 0;
+            RGFW_window_getSizeInPixels(window, &fbw, &fbh);
+            if (fbw != window_width || fbh != window_height)
+                handle_framebuffer_resize(fbw, fbh);
+        }
+
+        // Poll mouse position (--no-mouse parks it far off so the repel never triggers).
+        float mouse_position[2] = {-1e9f, -1e9f};
+        if (!no_mouse)
+        {
+            RGFW_window_getMouse(window, &xpos, &ypos);
+            mouse_position[0] = (float)xpos * mouse_scale;
+            mouse_position[1] = (float)ypos * mouse_scale;
+        }
 
         double _tp;
         if (profile) { glFinish(); _tp = get_time(); }
@@ -454,9 +587,9 @@ int main(int argc, char **argv)
         buffer_flip(&positionBuffer);
         LAP(1);
 
-        // READBACK PROBE: copy the fresh position + velocity textures into PBOs
-        // (GL_PIXEL_PACK_BUFFER). Measures whether glReadPixels FBO->PBO stays on
-        // the GPU or stalls. Not yet wired to any attribute -- pure cost measurement.
+        // Copy the fresh position + velocity textures into PBOs (FBO -> GL_PIXEL_PACK_BUFFER,
+        // stays on-gpu). Those PBOs are bound as the point passes' vertex attributes, and
+        // pbo_pos is also CPU-mapped to build the tile-coherent draw order.
         glBindFramebuffer(GL_READ_FRAMEBUFFER, positionBuffer.framebuffers[positionBuffer.current]);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
         glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, 0);
@@ -484,7 +617,25 @@ int main(int argc, char **argv)
             shader_use(&densityShader);
             shader_set_uniform_int(&densityShader, "density_buffer_downsampling", densityBufferDownsampling);
             buffer_bind(&densityBuffer, current);
+            glBlendFunc(GL_ONE, GL_ONE); // additive density accumulation (unbounded)
             buffer_update_n(&densityBuffer, P / densitySubsample);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // restore the global blend
+
+            // Auto-headroom: read the fresh (tiny) density field back, take a high
+            // percentile (robust to outlier hot-spots, unlike the raw max), and EMA it --
+            // the envelope follower that sets the colormap's makeup gain.
+            if (renderHeadroom <= 0.0)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[densityBuffer.current]);
+                glReadPixels(0, 0, density_width, density_height, GL_RED, GL_FLOAT, density_readback);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                int n = density_width * density_height;
+                qsort(density_readback, n, sizeof(float), cmp_float);
+                int k = (int)(headroomPct * (n - 1));
+                if (k < 0) k = 0; else if (k >= n) k = n - 1;
+                float level = density_readback[k];
+                headroom_ema = (float)ema(headroom_ema, level * headroomMargin, headroomAttack);
+            }
         }
         LAP(2);
 
@@ -511,6 +662,9 @@ int main(int argc, char **argv)
         buffer_bind(&renderBuffer, current);
 
         shader_use(&screenShader);
+        // Headroom: auto-tracked envelope (renderHeadroom == 0) or the fixed override.
+        shader_set_uniform_float(&screenShader, "render_headroom",
+                                 renderHeadroom > 0.0 ? (float)renderHeadroom : headroom_ema);
         // Draw in tile-coherent order via the index buffer (ibo stays bound in the VAO).
         glDrawElements(GL_POINTS, P, GL_UNSIGNED_INT, 0);
         LAP(4);
@@ -576,6 +730,19 @@ int main(int argc, char **argv)
                 handle_framebuffer_resize(event.update.w, event.update.h);
             }
         }
+
+        // --fps-cap: nudge a per-frame sleep so the EMA frame time settles at the
+        // target. frame_ms (measured top-to-top) already includes this sleep, so a
+        // simple proportional controller converges. Clamps at 0 when we're already
+        // slower than target -- no slack to give back.
+        // ponytail: plain P-controller, fine for a soft cap; add I/D if it hunts.
+        if (fps_cap > 0)
+        {
+            double target_ms = 1000.0 / fps_cap;
+            fps_sleep_ms += (target_ms - frame_ms) * 0.5;
+            if (fps_sleep_ms < 0.0) fps_sleep_ms = 0.0;
+            sleep_ms(fps_sleep_ms);
+        }
         epoch_counter++;
     }
 
@@ -596,10 +763,22 @@ int main(int argc, char **argv)
         fprintf(stdout, "SUMMARY frame=%.2f ms (%.0f fps)\n", frame_ms, frame_ms > 0 ? 1000.0 / frame_ms : 0);
     }
 
+    // Debug: dump the final frame + density/trail fields for inspection (--dump).
+    if (dump_path)
+    {
+        char path[1024];
+        snprintf(path, sizeof path, "%s_frame.ppm", dump_path);
+        dump_ppm_rgb(path, width, height, framebuffers[renderBuffer.current]);
+        snprintf(path, sizeof path, "%s_density.ppm", dump_path);
+        dump_ppm_scalar(path, density_width, density_height, framebuffers[densityBuffer.current]);
+        snprintf(path, sizeof path, "%s_trail.ppm", dump_path);
+        dump_ppm_scalar(path, trail_width, trail_height, framebuffers[trailBuffer.current]);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    }
+
     // Clean up
     // TODO: clean up after oneself better
     glBindVertexArray(0);
-    glDeleteBuffers(1, &vertex_buffer);
     glDeleteTextures(8, textures);
     glDeleteFramebuffers(8, framebuffers);
     RGFW_window_close(window);
@@ -673,7 +852,24 @@ void window_setup()
     }
     else
     {
-        flags |= RGFW_windowCenter;
+        if (whichMonitor != 0)
+        {
+            size_t monitorCount;
+            RGFW_monitor **monitors = RGFW_getMonitors(&monitorCount);
+            if ((size_t)whichMonitor < monitorCount)
+            {
+                RGFW_monitor *monitor = monitors[whichMonitor];
+                win_x = monitor->x + (monitor->mode.w - width) / 2;
+                win_y = monitor->y + (monitor->mode.h - height) / 2;
+                printf("monitor %d: origin=(%d,%d) size=(%d,%d) -> win=(%d,%d)\n",
+                       whichMonitor, monitor->x, monitor->y,
+                       monitor->mode.w, monitor->mode.h, win_x, win_y);
+            }
+        }
+        else
+        {
+            flags |= RGFW_windowCenter;
+        }
     }
 
     window = RGFW_createWindow(title, win_x, win_y, width, height, flags);
@@ -683,6 +879,9 @@ void window_setup()
         fprintf(stderr, "Failed to create RGFW window\n");
         exit(EXIT_FAILURE);
     }
+
+    if (!fullscreen && whichMonitor != 0)
+        RGFW_window_move(window, win_x, win_y);
 
     // Fullscreen has two modes: same-space borderless cover (no focus steal) vs
     // native fullscreen Space (steals focus by design). See each branch.
@@ -724,6 +923,9 @@ void window_setup()
     height = (int)((float)logical_height / render_scale + 0.5f);
     mouse_scale = (logical_width > 0) ? (float)width / (float)logical_width : 1.0f;
 
+    printf("window: monitor=%d logical=%dx%d framebuffer(device px)=%dx%d render=%dx%d\n",
+           whichMonitor, logical_width, logical_height, window_width, window_height, width, height);
+
     // Quit when escape is pressed (reported through RGFW_window_shouldClose)
     RGFW_window_setExitKey(window, RGFW_keyEscape);
 
@@ -744,7 +946,6 @@ void window_setup()
 
 void handle_framebuffer_resize(int new_width, int new_height)
 {
-    printf("handle_framebuffer_resize()\n");
     // The resize event carries logical points. Query the GL framebuffer (device px)
     // for the upscale target, recompute the render resolution from logical points /
     // render_scale, and refresh mouse_scale in case dpi changed.
@@ -753,6 +954,9 @@ void handle_framebuffer_resize(int new_width, int new_height)
     i32 fb_width, fb_height, logical_width, logical_height;
     RGFW_window_getSizeInPixels(window, &fb_width, &fb_height);
     RGFW_window_getSize(window, &logical_width, &logical_height);
+    printf("resize: logical=%dx%d framebuffer(device px)=%dx%d render=%d x %d\n",
+           logical_width, logical_height, fb_width, fb_height,
+           (int)(logical_width / render_scale + 0.5f), (int)(logical_height / render_scale + 0.5f));
     window_width = fb_width;
     window_height = fb_height;
     width = (int)((float)logical_width / render_scale + 0.5f);
@@ -865,24 +1069,11 @@ void buffer_setup()
     trail_width = width / trailBufferDownsampling + 1;
     trail_height = height / trailBufferDownsampling + 1;
 
-    // Setup vertex array
-    int *vertices = (int *)malloc(2 * P * sizeof(int));
-    for (int i = 0; i < 2 * P; i++)
-    {
-        vertices[i] = 0;
-    }
-
+    // Vertex array. The point passes get their attributes from the PBOs (wired below);
+    // the fullscreen-quad passes use gl_VertexID -- so the VAO needs no static buffer.
     GLuint vao;
     glGenVertexArrays(1, &vao);
     glBindVertexArray(vao);
-
-    glGenBuffers(1, &vertex_buffer);
-    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer);
-    glBufferData(GL_ARRAY_BUFFER, 2 * P * sizeof(int), vertices, GL_STATIC_DRAW);
-    free(vertices);
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
 
     // Calculate size of the physics buffer
     int PBwidth = ceil(sqrt(P));
@@ -935,10 +1126,14 @@ void buffer_setup()
     glGenFramebuffers(8, framebuffers);
 
     // Texture 0 - Density buffer
-    densityBuffer.minmag_filter = GL_NEAREST; // GL_LINEAR
+    densityBuffer.minmag_filter = densityNearest ? GL_NEAREST : GL_LINEAR; // --density-nearest for chunky pixels
     densityBuffer.wrap_st = GL_REPEAT;
     densityBuffer.dim = BE_1D;
     buffer_allocate(&densityBuffer, current, densityBufferIndex, density_width, density_height, NULL);
+    // Scratch for the auto-headroom: read the (tiny, downsampled) density buffer back to
+    // find its max each density update. Sized generously so a resize can't overflow it.
+    density_readback = (float *)malloc((size_t)(density_width + 8) * (density_height + 8) * sizeof(float));
+    headroom_ema = (float)(renderHeadroom > 0.0 ? renderHeadroom : 50.0); // seed the follower
 
     positionBuffer.minmag_filter = GL_NEAREST;
     positionBuffer.dim = BE_2D;
@@ -946,9 +1141,11 @@ void buffer_setup()
     velocityBuffer.dim = BE_2D;
 
     // Texture 1 - Position buffer 1
-    srand((unsigned int)time(NULL));
+    // --seed makes the initial positions (and so the whole deterministic gpu evolution)
+    // reproducible, which is what lets before/after dumps actually be comparable.
+    srand(rng_seed ? (unsigned int)rng_seed : (unsigned int)time(NULL));
     float margin = (width < height ? width : height) * 0.1f;
-    float noise_seed = 10 * get_time() + frand01();
+    float noise_seed = rng_seed ? (float)rng_seed : (10 * get_time() + frand01());
     fprintf(stdout, "Generating starting positions...\n");
     int N = PBwidth * PBheight * 2;
     float *positions = (float *)malloc(N * sizeof(float));
