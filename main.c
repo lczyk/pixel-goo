@@ -1435,6 +1435,13 @@ void handle_framebuffer_resize(int new_width, int new_height) {
     trail_height = height / trailBufferDownsampling + 1;
     buffer_reallocate(&trailBuffer, current, trail_width, trail_height);
     buffer_reallocate(&trailBuffer, other, trail_width, trail_height);
+    // sort_counts is sized by tile count, which grows with width/height -- resize it too,
+    // else rebuild_sort_order writes past the end (sort_idx/sort_key are P-sized, stable).
+    {
+        int tilesW = (width + sort_tile - 1) / sort_tile;
+        int tilesH = (height + sort_tile - 1) / sort_tile;
+        sort_counts = (int *)realloc(sort_counts, ((size_t)tilesW * tilesH + 1) * sizeof(int));
+    }
 }
 
 //=====================================================
