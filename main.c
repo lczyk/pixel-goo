@@ -522,7 +522,9 @@ static void parse_args(int argc, char **argv) {
     dropt_bool windowed = 0;
     dropt_bool no_vsync = 0;
     dropt_bool prof = 0;
+#ifdef RGFW_MACOS
     dropt_bool no_focus = 0;
+#endif
     dropt_bool dens_near = 0;
     dropt_bool nomouse = 0;
 
@@ -627,8 +629,11 @@ static void parse_args(int argc, char **argv) {
          parse_int, &max_iterations},
         {'\0', "warmup", "Simulate N frames before presenting -- skips the boring startup ramp (both windowed + headless).", "N",
          parse_int, &warmup},
+        // NOTE: macos-only -- samespace cover (Spaces, focus-steal) is meaningless on x11/wayland
+#ifdef RGFW_MACOS
         {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
          dropt_handle_bool, &no_focus},
+#endif
         {'\0', "dump", "At exit, write frame + density + trail to <prefix>_*.ppm.", "PREFIX",
          dropt_handle_string, &dump_path},
         {'\0', "headless", "Render -N frames at render-res, piped to ffmpeg (e.g. out.mp4); no window. Needs ffmpeg.", "OUT",
@@ -733,8 +738,10 @@ static void parse_args(int argc, char **argv) {
         vsync = false;
     if (prof)
         profile = true;
+#ifdef RGFW_MACOS
     if (no_focus)
         no_keyfocus_steal = true;
+#endif
     if (dens_near)
         densityNearest = true;
     if (nomouse)
@@ -1099,7 +1106,11 @@ int main(int argc, char **argv) {
         // showed the window background. [update] re-fits the drawable; it's a no-op when stable.
         if (!headless_path && presenting) // warmup: simulate in the bg, present nothing yet
         {
+#ifdef RGFW_MACOS
+            // macos retina can flip backing scale mid-frame (window dragged across
+            // monitors of different dpi); resync the gl drawable. x11/wayland don't.
             RGFW_window_updateContext_OpenGL(window);
+#endif
             {
                 i32 fbw = 0, fbh = 0;
                 RGFW_window_getSizeInPixels(window, &fbw, &fbh);
@@ -1332,6 +1343,7 @@ void window_setup() {
 
     // Fullscreen has two modes: same-space borderless cover (no focus steal) vs
     // native fullscreen Space (steals focus by design). See each branch.
+#ifdef RGFW_MACOS
     if (fullscreen && no_keyfocus_steal) {
         // Same-space cover: no native toggleFullScreen (which opens a new Space and
         // steals focus). Cover the display in the current Space, above the menu bar.
@@ -1352,6 +1364,13 @@ void window_setup() {
         // canBecomeKeyWindow override in RGFW.h it can now take key focus.
         RGFW_window_focus(window);
     }
+#else
+    // x11/wayland: no Spaces, fullscreen focus is compositor-controlled. plain fullscreen.
+    if (fullscreen) {
+        RGFW_window_move(window, win_x, win_y);
+        RGFW_window_setFullscreen(window, RGFW_TRUE);
+    }
+#endif
 
     // The actual framebuffer (window_width/height) is in device pixels and is only
     // the final upscale target. The sim renders at render resolution (width/height)
