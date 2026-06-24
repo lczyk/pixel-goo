@@ -5,10 +5,10 @@
 
 #include <gl.h>
 
-static void buffer_set_index(Buffer* b, const Bwhich which, const PBindex index);
-static void buffer_check_shape(Buffer* b, const int width, const int height);
+static void buffer_set_index(Buffer *b, const Bwhich which, const PBindex index);
+static void buffer_check_shape(Buffer *b, const int width, const int height);
 
-void buffer_allocate(Buffer* b, const Bwhich which, const PBindex index, const int width, const int height, const char* data) {
+void buffer_allocate(Buffer *b, const Bwhich which, const PBindex index, const int width, const int height, const char *data) {
     buffer_check_shape(b, width, height);
     if (which == screen) {
         fprintf(stderr, "[%s] cannot allocate the screen buffer", b->name);
@@ -45,50 +45,60 @@ void buffer_allocate(Buffer* b, const Bwhich which, const PBindex index, const i
     b->height = height;
 }
 
-void buffer_reallocate(Buffer* b, const Bwhich which, const int width, const int height) {
+void buffer_reallocate(Buffer *b, const Bwhich which, const int width, const int height) {
     buffer_allocate(b, which, b->current, width, height, NULL);
 }
 
-void buffer_flip(Buffer* b) {
+void buffer_flip(Buffer *b) {
     PBindex temp = b->current;
     b->current = b->other;
     b->other = temp;
 }
 
-void buffer_bind(Buffer* b, const Bwhich which) {
+void buffer_bind(Buffer *b, const Bwhich which) {
     GLint framebuffer = 0;
     switch (which) {
-        case current: { framebuffer = b->framebuffers[b->current]; } break;
-        case other: { framebuffer = b->framebuffers[b->other]; } break;
-        case screen: { framebuffer = 0; } break;
+    case current: {
+        framebuffer = b->framebuffers[b->current];
+    } break;
+    case other: {
+        framebuffer = b->framebuffers[b->other];
+    } break;
+    case screen: {
+        framebuffer = 0;
+    } break;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     glViewport(0, 0, b->width, b->height); // Change the viewport to the size of the 1D texture vector
-    glClear(GL_COLOR_BUFFER_BIT); // Dont need to clear it as its writing to each pixel anyway
+    glClear(GL_COLOR_BUFFER_BIT);          // Dont need to clear it as its writing to each pixel anyway
 }
 
-void buffer_update(Buffer* b) {
+void buffer_update(Buffer *b) {
     (void)b;
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4); // Need to only write 4 points since vertex shader makes them into a quad over the entire screen anyway
 }
 
-void buffer_update_n(Buffer* b, const int P) {
+void buffer_update_n(Buffer *b, const int P) {
     (void)b;
     glDrawArrays(GL_POINTS, 0, P);
 }
 
-static void buffer_set_index(Buffer* b, const Bwhich which, const PBindex index) {
+static void buffer_set_index(Buffer *b, const Bwhich which, const PBindex index) {
     switch (which) {
-        case current: { b->current = index; } break;
-        case other: { b->other = index; } break;
-        case screen: {
-            fprintf(stderr, "[%s] can't set object index to screen buffer", b->name);
-            exit(EXIT_FAILURE);
-        } break;
+    case current: {
+        b->current = index;
+    } break;
+    case other: {
+        b->other = index;
+    } break;
+    case screen: {
+        fprintf(stderr, "[%s] can't set object index to screen buffer", b->name);
+        exit(EXIT_FAILURE);
+    } break;
     }
 }
 
-static void buffer_check_shape(Buffer* b, const int width, const int height) {
+static void buffer_check_shape(Buffer *b, const int width, const int height) {
     GLint max_renderbuffer_size;
     glGetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &max_renderbuffer_size);
     if (width > max_renderbuffer_size) {
