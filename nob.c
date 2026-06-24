@@ -8,7 +8,7 @@ exec ./bin/nob "$@"
 // argv[0] is ./bin/nob, so the Go Rebuild Urself tech rebuilds in place there
 // when nob.c changes (NOB_GO_REBUILD_URSELF below).
 //
-// Targets: build (default), run, clean.
+// Targets: build (default), run, clean, format.
 
 #define NOB_IMPLEMENTATION
 #define NOB_STRIP_PREFIX
@@ -22,7 +22,7 @@ exec ./bin/nob "$@"
 #define SHADER_DIR "shaders" // holds .vert/.frag sources + generated <name>.h (gitignored)
 #define BIN_DIR "bin"
 #define DEFAULT_PARAMS_SRC "default-params.ini" // source-of-truth default config
-#define DEFAULT_PARAMS_HDR "default_params.h"  // generated token array (gitignored)
+#define DEFAULT_PARAMS_HDR "default_params.h"   // generated token array (gitignored)
 
 static const char *bin_path = BIN_DIR "/goo";
 
@@ -30,7 +30,10 @@ static const char *bin_path = BIN_DIR "/goo";
 static const char *shaders[] = {"copy", "debug", "density", "position", "screen", "trail", "upscale", "velocity"};
 
 static const char *sources[] = {
-    "main.c", "shader.c", "buffer.c", "rgfw_impl.c",
+    "main.c",
+    "shader.c",
+    "buffer.c",
+    "rgfw_impl.c",
     // dropt cli option parser is now a single header (lib/dropt/dropt.h);
     // main.c emits its impl via DROPT_IMPLEMENTATION
     // inih .ini config parser is likewise single-header (lib/ini.h); main.c
@@ -55,14 +58,25 @@ static void sb_append_escaped(String_Builder *sb, const char *src, size_t count)
     for (size_t i = 0; i < count; i++) {
         unsigned char c = (unsigned char)src[i];
         switch (c) {
-            case '"':  sb_append_cstr(sb, "\\\""); break;
-            case '\\': sb_append_cstr(sb, "\\\\"); break;
-            case '\n': sb_append_cstr(sb, "\\n");  break;
-            case '\t': sb_append_cstr(sb, "\\t");  break;
-            case '\r': break; // drop CR -> matches python text-mode universal newlines
-            default:
-                if (c >= 0x20 && c < 0x7f) da_append(sb, (char)c);
-                else sb_appendf(sb, "\\%03o", c);
+        case '"':
+            sb_append_cstr(sb, "\\\"");
+            break;
+        case '\\':
+            sb_append_cstr(sb, "\\\\");
+            break;
+        case '\n':
+            sb_append_cstr(sb, "\\n");
+            break;
+        case '\t':
+            sb_append_cstr(sb, "\\t");
+            break;
+        case '\r':
+            break; // drop CR -> matches python text-mode universal newlines
+        default:
+            if (c >= 0x20 && c < 0x7f)
+                da_append(sb, (char)c);
+            else
+                sb_appendf(sb, "\\%03o", c);
         }
     }
     da_append(sb, '"');
@@ -90,17 +104,22 @@ static bool generate_shaders(void) {
         const char *name = shaders[i];
         const char *vert = temp_sprintf("%s/%s.vert", SHADER_DIR, name);
         const char *frag = temp_sprintf("%s/%s.frag", SHADER_DIR, name);
-        const char *out  = temp_sprintf("%s/%s.h", SHADER_DIR, name);
+        const char *out = temp_sprintf("%s/%s.h", SHADER_DIR, name);
         // skip if the generated .h is newer than both its .vert/.frag sources
         const char *ins[] = {vert, frag};
         int needed = needs_rebuild(out, ins, NOB_ARRAY_LEN(ins));
-        if (needed < 0) return_defer(false);
-        if (!needed) continue;
+        if (needed < 0)
+            return_defer(false);
+        if (!needed)
+            continue;
         nob_log(NOB_INFO, "embedding %s -> %s", name, out);
         sb.count = 0;
-        if (!emit_shader(&sb, name, "Vertex", vert))   return_defer(false);
-        if (!emit_shader(&sb, name, "Fragment", frag)) return_defer(false);
-        if (!write_entire_file(out, sb.items, sb.count)) return_defer(false);
+        if (!emit_shader(&sb, name, "Vertex", vert))
+            return_defer(false);
+        if (!emit_shader(&sb, name, "Fragment", frag))
+            return_defer(false);
+        if (!write_entire_file(out, sb.items, sb.count))
+            return_defer(false);
     }
 defer:
     sb_free(sb);
@@ -124,22 +143,31 @@ static int default_param_handler(void *user, const char *section, const char *na
 static bool generate_default_params(void) {
     const char *ins[] = {DEFAULT_PARAMS_SRC};
     int needed = needs_rebuild(DEFAULT_PARAMS_HDR, ins, NOB_ARRAY_LEN(ins));
-    if (needed < 0) return false;
-    if (!needed) return true;
+    if (needed < 0)
+        return false;
+    if (!needed)
+        return true;
     nob_log(NOB_INFO, "embedding %s -> %s", DEFAULT_PARAMS_SRC, DEFAULT_PARAMS_HDR);
 
     bool result = true;
     String_Builder body = {0};
     int err = ini_parse(DEFAULT_PARAMS_SRC, default_param_handler, &body);
-    if (err < 0) { nob_log(NOB_ERROR, "cannot open %s", DEFAULT_PARAMS_SRC); return_defer(false); }
-    if (err > 0) { nob_log(NOB_ERROR, "%s: parse error on line %d", DEFAULT_PARAMS_SRC, err); return_defer(false); }
+    if (err < 0) {
+        nob_log(NOB_ERROR, "cannot open %s", DEFAULT_PARAMS_SRC);
+        return_defer(false);
+    }
+    if (err > 0) {
+        nob_log(NOB_ERROR, "%s: parse error on line %d", DEFAULT_PARAMS_SRC, err);
+        return_defer(false);
+    }
 
     String_Builder out = {0};
     sb_appendf(&out, "// generated by nob.c from %s -- do not edit\n", DEFAULT_PARAMS_SRC);
     sb_append_cstr(&out, "static const char *DEFAULT_PARAMS[] = {\n");
     sb_append_buf(&out, body.items, body.count);
     sb_append_cstr(&out, "};\n");
-    if (!write_entire_file(DEFAULT_PARAMS_HDR, out.items, out.count)) result = false;
+    if (!write_entire_file(DEFAULT_PARAMS_HDR, out.items, out.count))
+        result = false;
     sb_free(out);
 defer:
     sb_free(body);
@@ -147,13 +175,15 @@ defer:
 }
 
 static bool build_goo(void) {
-    if (!mkdir_if_not_exists(BIN_DIR)) return false;
+    if (!mkdir_if_not_exists(BIN_DIR))
+        return false;
 
     // skip the compile if bin/goo is newer than every source + generated header.
     // headers (shaders/<name>.h, *.h) are pulled in via #include, so editing one
     // must trigger a rebuild -- list them as inputs alongside the .c TUs.
     File_Paths inputs = {0};
-    for (size_t i = 0; i < NOB_ARRAY_LEN(sources); i++) da_append(&inputs, sources[i]);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(sources); i++)
+        da_append(&inputs, sources[i]);
     for (size_t i = 0; i < NOB_ARRAY_LEN(shaders); i++)
         da_append(&inputs, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
     da_append(&inputs, "shader.h");
@@ -165,7 +195,8 @@ static bool build_goo(void) {
     da_append(&inputs, DEFAULT_PARAMS_HDR); // generated; main.c includes it
     int needed = needs_rebuild(bin_path, inputs.items, inputs.count);
     da_free(inputs);
-    if (needed < 0) return false;
+    if (needed < 0)
+        return false;
     if (!needed) {
         nob_log(NOB_INFO, "%s up to date", bin_path);
         return true;
@@ -176,17 +207,46 @@ static bool build_goo(void) {
     cmd_append(&cmd, "-O3");
     cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR);
     cmd_append(&cmd, "-o", bin_path);
-    for (size_t i = 0; i < NOB_ARRAY_LEN(sources); i++) cmd_append(&cmd, sources[i]);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(sources); i++)
+        cmd_append(&cmd, sources[i]);
     add_platform_libs(&cmd);
     return cmd_run(&cmd);
 }
 
+#define CLANG_FORMAT_STYLE "{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 0}"
+
+// clang-format every top-level .c/.h in place. read_entire_dir is non-recursive,
+// so lib/ (vendored single-headers) is skipped -- we don't reformat third-party code.
+static bool format_sources(void) {
+    bool result = true;
+    File_Paths files = {0};
+    if (!read_entire_dir(".", &files))
+        return false;
+    Cmd cmd = {0};
+    cmd_append(&cmd, "clang-format", "-style=" CLANG_FORMAT_STYLE, "-i");
+    size_t base = cmd.count;
+    for (size_t i = 0; i < files.count; i++) {
+        const char *f = files.items[i];
+        size_t n = strlen(f);
+        bool is_c = n > 2 && strcmp(f + n - 2, ".c") == 0;
+        bool is_h = n > 2 && strcmp(f + n - 2, ".h") == 0;
+        if (is_c || is_h)
+            cmd_append(&cmd, f);
+    }
+    if (cmd.count > base)
+        result = cmd_run(&cmd);
+    cmd_free(cmd);
+    da_free(files);
+    return result;
+}
+
 static void usage(const char *program) {
-    nob_log(NOB_INFO, "usage: %s [build|run|clean|help]", program);
-    nob_log(NOB_INFO, "  build  compile to %s", bin_path);
-    nob_log(NOB_INFO, "  run    build and run");
-    nob_log(NOB_INFO, "  clean  remove %s/ and generated %s/*.h", BIN_DIR, SHADER_DIR);
-    nob_log(NOB_INFO, "  help   (default) show this message");
+    nob_log(NOB_INFO, "usage: %s [build|run|clean|format|help]", program);
+    nob_log(NOB_INFO, "  build   compile to %s", bin_path);
+    nob_log(NOB_INFO, "  run     build and run");
+    nob_log(NOB_INFO, "  clean   remove %s/ and generated %s/*.h", BIN_DIR, SHADER_DIR);
+    nob_log(NOB_INFO, "  format  clang-format top-level *.c/*.h (skips lib/)");
+    nob_log(NOB_INFO, "  help    (default) show this message");
 }
 
 int main(int argc, char **argv) {
@@ -212,21 +272,29 @@ int main(int argc, char **argv) {
         return cmd_run(&cmd) ? 0 : 1;
     }
 
+    if (strcmp(target, "format") == 0) {
+        return format_sources() ? 0 : 1;
+    }
+
     if (strcmp(target, "build") != 0 && strcmp(target, "run") != 0) {
         nob_log(NOB_ERROR, "unknown target: %s", target);
         usage(program);
         return 1;
     }
 
-    if (!generate_shaders()) return 1;
-    if (!generate_default_params()) return 1;
-    if (!build_goo()) return 1;
+    if (!generate_shaders())
+        return 1;
+    if (!generate_default_params())
+        return 1;
+    if (!build_goo())
+        return 1;
 
     if (strcmp(target, "run") == 0) {
         // forward everything after "run" to goo, e.g. `nob run --help -p 1000`
         Cmd cmd = {0};
         cmd_append(&cmd, bin_path);
-        for (int i = 2; i < argc; i++) cmd_append(&cmd, argv[i]);
+        for (int i = 2; i < argc; i++)
+            cmd_append(&cmd, argv[i]);
         return cmd_run(&cmd) ? 0 : 1;
     }
 
