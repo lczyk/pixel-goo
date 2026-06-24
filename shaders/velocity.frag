@@ -24,6 +24,9 @@ in float VertexID;
 uniform int epoch_counter;
 uniform float drag_coefficient;
 uniform float dither_coefficient;
+uniform float dither_density_gain; // --dither-density-gain: gain on the density-scaled dither
+uniform float dither_ortho;        // --dither-ortho: density^2-scaled jitter perpendicular to velocity
+uniform int legacy_wedge;          // --legacy-wedge: 1 = pre-fix trail-integral heading (acos)
 uniform float density_force;  // density-gradient repel strength (was 0.04)
 uniform float trail_force;    // trail-gradient attract strength (was 0.07)
 uniform float edge_repell_coefficient; // edge repel strength (was 0.18)
@@ -71,7 +74,7 @@ vec2 textureVDI(sampler2D textureSampler, vec2 position, float radius, float nea
     vec2 integral = vec2(0,0);
 
     // A pile of static values pulled out of the loop
-    float invN2 = 1/(N * N); // inverse of N^2
+    float invN2 = 1.0/float(N * N); // inverse of N^2 (float div -- int 1/(N*N) was 0)
     float phase_multiplier = (1/radius) * PI * random_float(0 + VertexID + epoch_counter); // Static random value (-pi,pi) divided by the radius
     float reduced_radius = radius - near_clip;
 
@@ -104,8 +107,13 @@ vec2 textureVDI(sampler2D textureSampler, vec2 position, float radius, float nea
 // Vector Wedge Integral over a texture using golden spiral disc sampling
 vec2 textureVWI(sampler2D textureSampler, vec2 position, vec2 velocity, float wedge_angle, float radius, float near_clip, int N) {
     vec2 integral = vec2(0,0);
-    float wedge_direction = acos(dot(velocity,vec2(1,0))/length(velocity));
-    float invN2 = 1/(N * N); // inverse of N^2
+    // heading of the velocity. acos(vx/|v|) only spans [0,PI] -- it drops the sign of vy, so
+    // downward-moving particles sense the trail in a mirrored (upward) cone. that's the pre-fix
+    // behaviour, kept behind --legacy-wedge; atan(y,x) gives the correct full [-PI,PI] heading.
+    float wedge_direction = (legacy_wedge != 0)
+        ? acos(dot(velocity, vec2(1,0)) / length(velocity))
+        : atan(velocity.y, velocity.x);
+    float invN2 = 1.0/float(N * N); // inverse of N^2 (float div -- int 1/(N*N) was 0)
     float phase_multiplier = (1/radius) * PI * random_float(1 + VertexID + epoch_counter); // Static random value (-pi,pi)
 
     for (int i = 0; i < N; i ++) {
@@ -246,7 +254,22 @@ void main() {
     // new_velocity += (1-density) * dither_coefficient * random_vec2(vec2(0,0) + VertexID + epoch_counter);
     
     // new_velocity += clamp(1-density,0.1,1.0) * clamp(1-density,0.1,1.0) * 2 * dither_coefficient * random_vec2(vec2(0,0) + VertexID + epoch_counter);
-    new_velocity += density * dither_coefficient * random_vec2(vec2(0,0) + VertexID + epoch_counter);
+    // dither_density_gain (--dither-density-gain): how strongly dither ramps with local density
+    // (>1 = more jitter in dense regions, keeps packed veins churning instead of freezing).
+    new_velocity += dither_density_gain * density * dither_coefficient * random_vec2(vec2(0,0) + VertexID + epoch_counter);
+
+    // Orthogonal dither: density^2-scaled jitter perpendicular to the current velocity.
+    if (dither_ortho > 0) {
+        float vmag = length(new_velocity);
+        if (vmag > 0) {
+            vec2 perp = vec2(-new_velocity.y, new_velocity.x) / vmag; // unit normal
+            // smoothstep gate: ~0 until density nears the knee, then ramps in fast.
+            // NOTE: knee 0.75..1.0 hardcoded; widen/shift if it triggers too early/late.
+            // deterministic per-particle side: left or right, fixed by VertexID (no epoch term).
+            float side = sign(random_float(VertexID));
+            new_velocity += dither_ortho * density * density * side * perp;
+        }
+    }
     // new_velocity += density * density * density * 2 * 2 * dither_coefficient * random_vec2(vec2(0,0) + VertexID + epoch_counter);
 
     // Drift

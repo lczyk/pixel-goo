@@ -60,7 +60,7 @@ bool vsync = true;
 bool profile = false;              // --profile: glFinish per pass + print ms (disables pipelining)
 int max_iterations = 0;            // -N: exit after N PRESENTED frames (0 = unlimited); for benchmarking
 int warmup = 0;                    // --warmup: simulate this many frames before presenting (skip the boring ramp)
-int fps_cap = 0;                   // --fps-cap: throttle the average fps to this (0 = uncapped)
+int fps_cap = 0;                   // --fps: throttle the average fps to this (0 = uncapped)
 bool no_keyfocus_steal = false;    // --no-keyfocus-steal: show window w/out grabbing key focus
 bool no_border = false;            // --no-border: hide the title bar / border in windowed mode
 bool no_mouse = false;             // --no-mouse: disable the mouse repel (park the cursor far off)
@@ -176,6 +176,9 @@ int density_height = 0;
 
 double dragCoefficient = 0;   // --drag: quadratic velocity damping coefficient
 double ditherCoefficient = 0; // --dither: density-scaled random kick magnitude
+double ditherDensityGain = 0; // --dither-density-gain: gain on the density-scaled dither
+double ditherOrtho = 0;       // --dither-ortho: density^2-scaled jitter perpendicular to velocity
+bool legacyWedge = false;     // --legacy-wedge: old acos trail-integral heading (drops sign of vy)
 
 // Alpha blending of each of the fragments
 double trailIntensity = 0; // --trail-intensity: per-particle trail deposit
@@ -527,6 +530,7 @@ static void parse_args(int argc, char **argv) {
 #endif
     dropt_bool dens_near = 0;
     dropt_bool nomouse = 0;
+    dropt_bool legacy_wedge = 0;
 
     dropt_option options[] = {
         {'h', "help", "Show this help and exit.", NULL,
@@ -545,13 +549,13 @@ static void parse_args(int argc, char **argv) {
          parse_int, &height},
         {'\0', "no-vsync", "Disable vsync (uncap the frame rate).", NULL,
          dropt_handle_bool, &no_vsync},
-        {'\0', "fps-cap", "Throttle the average frame rate to N fps (0 = uncapped).", "N",
+        {'\0', "fps", "Throttle the average frame rate to N fps (0 = uncapped).", "N",
          parse_int, &fps_cap},
 
         {'\0', NULL, "\nPARTICLES", NULL, NULL, NULL},
         {'p', "particles", "Number of particles to simulate (plain or scientific notation, e.g. 200000, 1e6).", "N",
          parse_count, &P},
-        {'d', "density", "Particles per logical-pixel^2 (sim-area + render-scale independent; default 0.1; excludes -p).", "F",
+        {'d', "density", "Particles per logical-pixel^2 (sim-area + render-scale independent; default 0.05; excludes -p).", "F",
          parse_density, &init_density},
         {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier; bare -r = 2).", "N",
          parse_render_scale, &render_scale, dropt_attr_optional_val},
@@ -563,6 +567,10 @@ static void parse_args(int argc, char **argv) {
          dropt_handle_double, &dragCoefficient},
         {'\0', "dither", "Density-scaled random kick magnitude (default 0.1).", "F",
          dropt_handle_double, &ditherCoefficient},
+        {'\0', "dither-density-gain", "Gain on the density-scaled dither (>1 = more jitter in dense regions; default 6.5).", "F",
+         dropt_handle_double, &ditherDensityGain},
+        {'\0', "dither-ortho", "Density^2-scaled jitter perpendicular to velocity (default 0).", "F",
+         dropt_handle_double, &ditherOrtho},
         {'\0', "density-force", "Density-gradient repel strength (default 0.04).", "F",
          dropt_handle_double, &densityForce},
         {'\0', "trail-force", "Trail-gradient attract strength (default 0.07).", "F",
@@ -623,6 +631,8 @@ static void parse_args(int argc, char **argv) {
          dropt_handle_bool, &nomouse},
         {'\0', "mouse-debug", "Draw a green dot and trail at the cursor position.", NULL,
          dropt_handle_bool, &mouse_debug},
+        {'\0', "legacy-wedge", "Use the old acos trail-integral heading (drops sign of vy; pre-fix look).", NULL,
+         dropt_handle_bool, &legacy_wedge},
         {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
          dropt_handle_bool, &prof},
         {'N', "iterations", "Exit after N presented frames (0 = unlimited); for benchmarking.", "N",
@@ -746,6 +756,8 @@ static void parse_args(int argc, char **argv) {
         densityNearest = true;
     if (nomouse)
         no_mouse = true;
+    if (legacy_wedge)
+        legacyWedge = true;
 
     // Guard against values that would crash or hang the sim.
     if (P < 1) {
@@ -838,6 +850,9 @@ int main(int argc, char **argv) {
     shader_set_uniform_float(&densityShader, "kernel_radius", kernelRadius * (float)(SIM_SCALE / render_scale));
     shader_set_uniform_float(&velocityShader, "drag_coefficient", dragCoefficient);
     shader_set_uniform_float(&velocityShader, "dither_coefficient", ditherCoefficient);
+    shader_set_uniform_float(&velocityShader, "dither_density_gain", (float)ditherDensityGain);
+    shader_set_uniform_float(&velocityShader, "dither_ortho", (float)ditherOrtho);
+    shader_set_uniform_int(&velocityShader, "legacy_wedge", legacyWedge ? 1 : 0);
     shader_set_uniform_float(&velocityShader, "density_force", (float)densityForce);
     shader_set_uniform_float(&velocityShader, "trail_force", (float)trailForce);
     shader_set_uniform_float(&velocityShader, "edge_repell_coefficient", (float)edgeRepel);
@@ -880,7 +895,7 @@ int main(int argc, char **argv) {
     // profiling, so --no-vsync shows real fps without the serialisation penalty.
     double frame_prev = get_time();
     double frame_ms = 0.0;
-    double fps_sleep_ms = 0.0; // --fps-cap pacing: slack we sleep each frame
+    double fps_sleep_ms = 0.0; // --fps pacing: slack we sleep each frame
 
     //======================================
     //
@@ -894,7 +909,7 @@ int main(int argc, char **argv) {
 
     // Headless: open the ffmpeg pipe now that width/height (render res) are final. Frames are
     // raw rgb24 at render res; -vf vflip undoes glReadPixels' bottom-up order. Framerate from
-    // --fps-cap (default 60). Output codec is picked from the extension: .gif -> palette gif,
+    // --fps (default 60). Output codec is picked from the extension: .gif -> palette gif,
     // anything else -> h264 mp4. ponytail: two formats, add more branches if you need them.
     if (headless_path) {
         int fr = fps_cap > 0 ? fps_cap : 60;
@@ -912,7 +927,7 @@ int main(int argc, char **argv) {
             // gif: build a per-clip optimal 256-colour palette in one streaming pass
             // (ffmpeg buffers the stream for palettegen), default sierra2_4a dither.
             // yuv420p/-crf are mp4-only. NOTE: fps is honoured verbatim; many gif
-            // players floor high rates -- drop --fps-cap if playback looks fast.
+            // players floor high rates -- drop --fps if playback looks fast.
             snprintf(cmd, sizeof cmd,
                      "ffmpeg -loglevel error -y -f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
                      "-vf \"vflip,scale=%d:%d:flags=neighbor,split[s0][s1];"
@@ -1192,7 +1207,7 @@ int main(int argc, char **argv) {
                 }
             }
 
-            // --fps-cap: nudge a per-frame sleep so the EMA frame time settles at the
+            // --fps: nudge a per-frame sleep so the EMA frame time settles at the
             // target. frame_ms (measured top-to-top) already includes this sleep, so a
             // simple proportional controller converges. Clamps at 0 when we're already
             // slower than target -- no slack to give back.
