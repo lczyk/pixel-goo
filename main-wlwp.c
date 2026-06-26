@@ -16,6 +16,7 @@
 
 #include "sim.h"
 
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,6 +228,46 @@ static void egl_setup(void) {
 
     if (!gladLoadGL((GLADloadfunc)eglGetProcAddress))
         die("gladLoadGL failed");
+
+    // Context-level GL state. Lives here (not in main) so it's re-established when
+    // the context is recreated by gl_refresh.
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
+// Tear down the EGL context + surface (frees the freedreno per-submit leak). Shared
+// by gl_refresh and the final exit cleanup.
+static void egl_teardown(void) {
+    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (egl_surface != EGL_NO_SURFACE)
+        eglDestroySurface(egl_display, egl_surface);
+    if (egl_window)
+        wl_egl_window_destroy(egl_window);
+    if (egl_context != EGL_NO_CONTEXT)
+        eglDestroyContext(egl_display, egl_context);
+}
+
+// Bring up the GL context and the sim together. snap == NULL generates a fresh
+// field (first boot); a snapshot continues an existing sim across a context
+// recreate. The single bring-up path for both initial setup and gl_refresh.
+static void bringup(const SimSnapshot *snap) {
+    egl_setup(); // context + surface, glad loaded, GL state enabled
+    if (snap)
+        sim_restore(snap); // consumed by the sim_setup below
+    sim_setup();
+}
+
+// Recreate the EGL context to reclaim the freedreno per-submit leak (see debug/).
+// The whole sim lives in GL objects tied to the context, so snapshot the sim state,
+// tear the context down (which frees the leaked allocations), then bring it back up
+// from the snapshot. Costs one frame's hitch; the sim continues uninterrupted.
+static void gl_refresh(void) {
+    SimSnapshot *snap = sim_snapshot(); // read sim state back while the old context lives
+    egl_teardown();
+    sim_teardown_cpu(); // free CPU scratch so the bring-up below doesn't leak it
+    bringup(snap);
+    sim_snapshot_free(snap);
 }
 
 int main(int argc, char **argv) {
@@ -267,22 +308,19 @@ int main(int argc, char **argv) {
         die("layer surface configured with no size");
     dirty = false;
 
-    egl_setup();
-
     // Wayland gives logical px; treat the framebuffer as logical (output scale 1).
     // NOTE: fractional/hidpi output scale ignored -- on a 2x output the wallpaper
     // renders at logical res and the compositor upscales. wire wl_output scale +
     // wp_fractional_scale here if it looks soft on hidpi.
     sim_set_dims(surf_w, surf_h, surf_w, surf_h);
 
-    glEnable(GL_PROGRAM_POINT_SIZE);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    sim_setup();
+    bringup(NULL); // first boot: fresh field. same path gl_refresh uses with a snapshot.
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    // --gl-refresh: periodic GL-context recreation to bound the freedreno leak.
+    double last_refresh = get_time();
 
     // Mouse repel: track the pointer in sim space and feed its per-frame velocity,
     // same as the windowed front-end. Parked sentinel ({-1e9,..}) when the cursor is
@@ -294,9 +332,23 @@ int main(int argc, char **argv) {
         if (max_iterations > 0 && epoch_counter >= max_iterations)
             break;
 
-        // Drain pending wayland events (configure, closed, pointer) without blocking.
-        if (wl_display_dispatch_pending(display) == -1)
-            break;
+        // Pump wayland: flush our outgoing requests, then READ the socket (not just
+        // dispatch already-queued events) so configure/pointer/release events arrive.
+        // Non-blocking: poll with timeout 0 and only read when there's data ready.
+        wl_display_dispatch_pending(display);
+        wl_display_flush(display);
+        struct pollfd pfd = {.fd = wl_display_get_fd(display), .events = POLLIN};
+        if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) {
+            if (wl_display_dispatch(display) == -1)
+                break;
+        }
+
+        // Periodically recreate the GL context to reclaim the freedreno per-submit
+        // leak (see debug/). Skipped (gl_refresh_seconds == 0) by default.
+        if (gl_refresh_seconds > 0 && get_time() - last_refresh >= gl_refresh_seconds) {
+            gl_refresh();
+            last_refresh = get_time();
+        }
 
         if (dirty) {
             wl_egl_window_resize(egl_window, surf_w, surf_h, 0, 0);
@@ -330,13 +382,7 @@ int main(int argc, char **argv) {
     glBindVertexArray(0);
     glDeleteTextures(8, textures);
     glDeleteFramebuffers(8, framebuffers);
-    eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (egl_surface != EGL_NO_SURFACE)
-        eglDestroySurface(egl_display, egl_surface);
-    if (egl_window)
-        wl_egl_window_destroy(egl_window);
-    if (egl_context != EGL_NO_CONTEXT)
-        eglDestroyContext(egl_display, egl_context);
+    egl_teardown();
     eglTerminate(egl_display);
     zwlr_layer_surface_v1_destroy(layer_surface);
     wl_surface_destroy(surface);

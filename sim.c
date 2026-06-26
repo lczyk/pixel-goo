@@ -179,6 +179,12 @@ int P = 200000; // --particles
 double pass_ms[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 const char *pass_name[8] = {"vel", "pos", "dens", "trail", "scr", "up", "rdbk", "sort"};
 
+double gl_refresh_seconds = 0; // --gl-refresh: GL-context recreate cadence (0 = off); wallpaper only
+
+// When set (via sim_restore), the next buffer_setup uploads this saved state
+// instead of generating a fresh random field. Consumed (cleared) by buffer_setup.
+static const SimSnapshot *g_restore = NULL;
+
 // Monotonic seconds; replaces glfwGetTime
 double get_time(void) {
     struct timespec ts;
@@ -389,6 +395,33 @@ static dropt_error parse_count(dropt_context *ctx, const dropt_option *opt, cons
     if (e == dropt_error_none)
         p_given = true;
     return e;
+}
+
+// --gl-refresh: a duration with an optional unit suffix s/m/h/d (bare = seconds).
+// e.g. "10s", "30m", "1h", "1d", "0". Stored as seconds (double).
+static dropt_error parse_duration(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest) {
+    (void)ctx;
+    (void)opt;
+    if (arg == NULL || arg[0] == '\0')
+        return dropt_error_insufficient_arguments;
+    char *end;
+    double v = strtod(arg, &end);
+    if (end == arg || v < 0)
+        return dropt_error_mismatch;
+    double mult = 1.0;
+    if (*end != '\0') {
+        switch (*end) {
+        case 's': mult = 1.0; break;
+        case 'm': mult = 60.0; break;
+        case 'h': mult = 3600.0; break;
+        case 'd': mult = 86400.0; break;
+        default: return dropt_error_mismatch;
+        }
+        if (end[1] != '\0') // only a single-char unit suffix is allowed
+            return dropt_error_mismatch;
+    }
+    *(double *)dest = v * mult;
+    return dropt_error_none;
 }
 
 // --density/-d: plain double, but flag that it was explicitly set (for -p/-d exclusion).
@@ -646,18 +679,26 @@ void parse_args(int argc, char **argv, bool wlwp) {
          dropt_handle_string, &headless_path},
     };
 
-    // Assemble the final table: core (+ window-only unless wlwp) + sentinel.
+    // Wallpaper-only options: only meaningful for the wayland layer-shell front-end.
+    dropt_option wlwp_opts[] = {
+        {'\0', NULL, "\nWALLPAPER", NULL, NULL, NULL},
+        {'\0', "gl-refresh", "Recreate the GL context every <dur> (s/m/h/d, e.g. 30m; 0 = never) to reclaim the freedreno driver leak. See debug/.", "DUR",
+         parse_duration, &gl_refresh_seconds},
+    };
+
+    // Assemble the final table: core + (wallpaper-only if wlwp, else window-only) + sentinel.
     size_t n_core = sizeof core_opts / sizeof core_opts[0];
-    size_t n_win = wlwp ? 0 : sizeof win_opts / sizeof win_opts[0];
-    dropt_option *options = malloc((n_core + n_win + 1) * sizeof(dropt_option));
+    dropt_option *extra = wlwp ? wlwp_opts : win_opts;
+    size_t n_extra = wlwp ? sizeof wlwp_opts / sizeof wlwp_opts[0]
+                          : sizeof win_opts / sizeof win_opts[0];
+    dropt_option *options = malloc((n_core + n_extra + 1) * sizeof(dropt_option));
     if (!options) {
         fprintf(stderr, "goo: out of memory setting up option parser\n");
         exit(EXIT_FAILURE);
     }
     memcpy(options, core_opts, n_core * sizeof(dropt_option));
-    if (n_win)
-        memcpy(options + n_core, win_opts, n_win * sizeof(dropt_option));
-    memset(options + n_core + n_win, 0, sizeof(dropt_option)); // sentinel
+    memcpy(options + n_core, extra, n_extra * sizeof(dropt_option));
+    memset(options + n_core + n_extra, 0, sizeof(dropt_option)); // sentinel
 
     const char *prog = wlwp ? "goo-wlwp" : "goo";
 
@@ -986,47 +1027,65 @@ void buffer_setup(void) {
     velocityBuffer.minmag_filter = GL_NEAREST;
     velocityBuffer.dim = BE_2D;
 
+    // Restore path (--gl-refresh): if a snapshot is queued and its dims match, upload
+    // the saved particle/trail state instead of generating a fresh field, so the sim
+    // continues across a GL-context recreate. NOTE: mismatched dims (only possible if
+    // the surface resized between snapshot and setup) fall through to a fresh field.
+    bool restoring = g_restore && g_restore->pb_w == PBwidth && g_restore->pb_h == PBheight &&
+                     g_restore->tr_w == trail_width && g_restore->tr_h == trail_height;
+
     // Texture 1 - Position buffer 1
     // --seed makes the initial positions (and so the whole deterministic gpu evolution)
     // reproducible, which is what lets before/after dumps actually be comparable.
-    srand(rng_seed ? (unsigned int)rng_seed : (unsigned int)time(NULL));
-    float margin = (sim_width < sim_height ? sim_width : sim_height) * 0.1f;
-    float noise_seed = rng_seed ? (float)rng_seed : (10 * get_time() + frand01());
-    fprintf(stdout, "Generating starting positions...\n");
-    int N = PBwidth * PBheight * 2;
-    float *positions = (float *)malloc(N * sizeof(float));
-    for (int i = 0; i < N; i += 2) {
-        // Generate random position in unit range
-        vec2 position = {frand01(), frand01()};
-        vec3 p0 = {10 * position[0], 10 * position[1], noise_seed};
-        vec3 p1 = {10 * position[0], 10 * position[1], noise_seed + 1};
-        vec2 noise = {glm_perlin_vec3(p0), glm_perlin_vec3(p1)};
-        position[0] += (float)init_warp * fmodf(noise[0], 1.0f);
-        position[1] += (float)init_warp * fmodf(noise[1], 1.0f);
+    const float *pos_data;
+    float *positions = NULL;
+    if (restoring) {
+        pos_data = g_restore->pos;
+    } else {
+        srand(rng_seed ? (unsigned int)rng_seed : (unsigned int)time(NULL));
+        float margin = (sim_width < sim_height ? sim_width : sim_height) * 0.1f;
+        float noise_seed = rng_seed ? (float)rng_seed : (10 * get_time() + frand01());
+        fprintf(stdout, "Generating starting positions...\n");
+        int N = PBwidth * PBheight * 2;
+        positions = (float *)malloc(N * sizeof(float));
+        for (int i = 0; i < N; i += 2) {
+            // Generate random position in unit range
+            vec2 position = {frand01(), frand01()};
+            vec3 p0 = {10 * position[0], 10 * position[1], noise_seed};
+            vec3 p1 = {10 * position[0], 10 * position[1], noise_seed + 1};
+            vec2 noise = {glm_perlin_vec3(p0), glm_perlin_vec3(p1)};
+            position[0] += (float)init_warp * fmodf(noise[0], 1.0f);
+            position[1] += (float)init_warp * fmodf(noise[1], 1.0f);
 
-        // Cull position to the center of the screen
-        position[0] = position[0] * (sim_width - 2 * margin) + margin;
-        position[1] = position[1] * (sim_height - 2 * margin) + margin;
+            // Cull position to the center of the screen
+            position[0] = position[0] * (sim_width - 2 * margin) + margin;
+            position[1] = position[1] * (sim_height - 2 * margin) + margin;
 
-        positions[i] = position[0];
-        positions[i + 1] = position[1];
+            positions[i] = position[0];
+            positions[i + 1] = position[1];
+        }
+        pos_data = positions;
     }
 
     fprintf(stdout, "Allocating buffers...\n");
-    buffer_allocate(&positionBuffer, current, positionBufferIndex1, PBwidth, PBheight, (const char *)positions);
+    buffer_allocate(&positionBuffer, current, positionBufferIndex1, PBwidth, PBheight, (const char *)pos_data);
 
     free(positions);
 
-    // Texture 2,3,4 - position buffer 2, velocity buffer 1 and 2
+    // Texture 2,3,4 - position buffer 2, velocity buffer 1 and 2. On restore, velocity
+    // current gets the saved velocities (else zero); the "other" halves stay zero (the
+    // double buffer flips fill them within a frame).
     buffer_allocate(&positionBuffer, other, positionBufferIndex2, PBwidth, PBheight, NULL);
-    buffer_allocate(&velocityBuffer, current, velocityBufferIndex1, PBwidth, PBheight, NULL);
+    buffer_allocate(&velocityBuffer, current, velocityBufferIndex1, PBwidth, PBheight,
+                    restoring ? (const char *)g_restore->vel : NULL);
     buffer_allocate(&velocityBuffer, other, velocityBufferIndex2, PBwidth, PBheight, NULL);
 
-    // Texture 5,6 - Trail double buffer
+    // Texture 5,6 - Trail double buffer (current restored from the snapshot if present)
     trailBuffer.minmag_filter = GL_NEAREST;
     trailBuffer.wrap_st = GL_REPEAT;
     trailBuffer.dim = BE_1D;
-    buffer_allocate(&trailBuffer, current, trailBufferIndex1, trail_width, trail_height, NULL);
+    buffer_allocate(&trailBuffer, current, trailBufferIndex1, trail_width, trail_height,
+                    restoring ? (const char *)g_restore->trail : NULL);
     buffer_allocate(&trailBuffer, other, trailBufferIndex2, trail_width, trail_height, NULL);
 
     // Texture 7 - internal render target (rgba colour) at render resolution.
@@ -1039,6 +1098,63 @@ void buffer_setup(void) {
     // The screen buffer is the window itself (the upscale target), in device px.
     screenBuffer.width = window_width;
     screenBuffer.height = window_height;
+
+    // Carry the auto-exposure state across a restore so it doesn't re-ramp, then
+    // consume the snapshot (one restore per snapshot).
+    if (restoring)
+        headroom_ema = g_restore->headroom_ema;
+    g_restore = NULL;
+}
+
+SimSnapshot *sim_snapshot(void) {
+    size_t pv = (size_t)PB_width * PB_height * 2;
+    size_t tn = (size_t)trail_width * trail_height;
+    SimSnapshot *s = (SimSnapshot *)calloc(1, sizeof *s);
+    if (s) {
+        s->pos = malloc(pv * sizeof(float));
+        s->vel = malloc(pv * sizeof(float));
+        s->trail = malloc(tn * sizeof(float));
+    }
+    if (!s || !s->pos || !s->vel || !s->trail) {
+        fprintf(stderr, "goo: out of memory for sim snapshot\n");
+        exit(EXIT_FAILURE);
+    }
+    s->pb_w = PB_width;
+    s->pb_h = PB_height;
+    s->tr_w = trail_width;
+    s->tr_h = trail_height;
+    s->headroom_ema = headroom_ema;
+    // Read the *current* halves of each double buffer (what sim_step just wrote).
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[positionBuffer.current]);
+    glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, s->pos);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[velocityBuffer.current]);
+    glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, s->vel);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[trailBuffer.current]);
+    glReadPixels(0, 0, trail_width, trail_height, GL_RED, GL_FLOAT, s->trail);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    return s;
+}
+
+void sim_restore(const SimSnapshot *s) { g_restore = s; }
+
+void sim_snapshot_free(SimSnapshot *s) {
+    if (!s)
+        return;
+    free(s->pos);
+    free(s->vel);
+    free(s->trail);
+    free(s);
+}
+
+void sim_teardown_cpu(void) {
+    free(sort_idx);
+    sort_idx = NULL;
+    free(sort_key);
+    sort_key = NULL;
+    free(sort_counts);
+    sort_counts = NULL;
+    free(density_readback);
+    density_readback = NULL;
 }
 
 //============================================================

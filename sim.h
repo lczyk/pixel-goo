@@ -88,6 +88,10 @@ extern double trailVelocityFloor;
 extern int trail_width, trail_height;
 extern int P;
 
+// --gl-refresh <dur>: how often (seconds) to recreate the GL context to reclaim
+// the freedreno per-submit leak (see debug/). 0 = never. wallpaper front-end only.
+extern double gl_refresh_seconds;
+
 // tile-coherent draw order
 extern GLuint ibo;
 extern unsigned int *sort_idx;
@@ -130,5 +134,30 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
 // nearest-upscale renderBuffer onto the default framebuffer (the window). caller
 // must have screenBuffer.width/height set to the current framebuffer size.
 void sim_present(void);
+
+// ---- GL-context refresh (freedreno leak workaround; see debug/) ----
+// The whole sim state lives in GL objects, so recreating the EGL context to
+// reclaim the driver leak means saving + restoring that state around it. Also the
+// groundwork for a future dump-to-file / load-from-file of the sim.
+typedef struct SimSnapshot {
+    int pb_w, pb_h;     // physics buffer dims (holds P particles)
+    int tr_w, tr_h;     // trail field dims
+    float *pos;         // pb_w*pb_h*2 (RG)
+    float *vel;         // pb_w*pb_h*2 (RG)
+    float *trail;       // tr_w*tr_h   (R)
+    float headroom_ema; // auto-exposure state
+} SimSnapshot;
+
+// read the live particle + trail buffers back to CPU. call with the GL context
+// still current (i.e. before tearing it down).
+SimSnapshot *sim_snapshot(void);
+// hand a snapshot to the NEXT sim_setup, which uploads it instead of generating
+// fresh initial state. consumed (cleared) by that sim_setup.
+void sim_restore(const SimSnapshot *s);
+void sim_snapshot_free(SimSnapshot *s);
+// free the CPU-side scratch (sort arrays, density readback) so a re-run of
+// sim_setup in a fresh context doesn't leak the old allocations. the GL objects
+// themselves are freed by the context teardown, so this only touches CPU memory.
+void sim_teardown_cpu(void);
 
 #endif /* SIM_H */
