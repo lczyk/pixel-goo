@@ -9,6 +9,9 @@ shaders/*.h
 # generated default-config tokens (see generate_default_params in nob.c)
 default_params.h
 
+# generated wayland protocol glue (see generate_wl_protocols in nob.c)
+wlwp/
+
 # nob build tool binary
 nob
 nob.old

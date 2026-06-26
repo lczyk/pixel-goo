@@ -25,12 +25,30 @@ exec ./bin/nob "$@"
 #define DEFAULT_PARAMS_HDR "default_params.h"   // generated token array (gitignored)
 
 static const char *bin_path = BIN_DIR "/goo";
+static const char *wlwp_bin_path = BIN_DIR "/goo-wlwp";
+
+#define WLWP_GEN_DIR "wlwp" // generated wayland protocol glue (gitignored)
+
+// Wayland protocols the wallpaper front-end needs. layer-shell is the wallpaper
+// mechanism; xdg-shell is pulled in for the types layer-shell references.
+static const char *wl_protocols[][2] = {
+    {"lib/protocols/xdg-shell.xml", "xdg-shell"},
+    {"lib/protocols/wlr-layer-shell-unstable-v1.xml", "wlr-layer-shell-unstable-v1"},
+};
+
+static const char *wlwp_sources[] = {
+    "main-wlwp.c",
+    "sim.c",
+    "shader.c",
+    "buffer.c",
+};
 
 // Each shader has a .vert + .frag embedded into <name>.h by generate_shaders()
 static const char *shaders[] = {"copy", "debug", "density", "position", "screen", "trail", "upscale", "velocity"};
 
 static const char *sources[] = {
     "main.c",
+    "sim.c",
     "shader.c",
     "buffer.c",
     "rgfw_impl.c",
@@ -174,6 +192,122 @@ defer:
     return result;
 }
 
+// quiet existence probe: run `cmd...` with stdio discarded, return exit success.
+static bool probe(const char *arg0, const char *arg1, const char *arg2) {
+    Cmd cmd = {0};
+    cmd_append(&cmd, arg0, arg1);
+    if (arg2)
+        cmd_append(&cmd, arg2);
+    return cmd_run(&cmd, .stdout_path = "/dev/null", .stderr_path = "/dev/null");
+}
+
+// wlwp is linux + wayland + egl only. Check the toolchain up front and, if
+// anything's missing, say exactly which package to install rather than dumping a
+// wall of compiler errors.
+static bool check_wlwp_deps(void) {
+#if !defined(__linux__)
+    nob_log(NOB_ERROR, "build-wlwp is linux-only (wayland layer-shell). this is not linux.");
+    return false;
+#else
+    bool ok = true;
+    struct {
+        const char *pkg;     // pkg-config name
+        const char *apt;     // package to install
+    } pkgs[] = {
+        {"wayland-client", "libwayland-dev"},
+        {"wayland-egl", "libwayland-dev"},
+        {"egl", "libegl-dev"},
+    };
+    for (size_t i = 0; i < NOB_ARRAY_LEN(pkgs); i++) {
+        if (!probe("pkg-config", "--exists", pkgs[i].pkg)) {
+            nob_log(NOB_ERROR, "missing dev lib '%s' -- install: sudo apt install %s", pkgs[i].pkg, pkgs[i].apt);
+            ok = false;
+        }
+    }
+    if (!probe("wayland-scanner", "--version", NULL)) {
+        nob_log(NOB_ERROR, "missing 'wayland-scanner' -- install: sudo apt install libwayland-bin");
+        ok = false;
+    }
+    return ok;
+#endif
+}
+
+// Generate the wayland protocol glue (client header + private code) for each xml
+// via wayland-scanner. Mirrors generate_shaders: only regenerates when the xml
+// (or its output) is stale.
+static bool generate_wl_protocols(void) {
+    if (!mkdir_if_not_exists(WLWP_GEN_DIR))
+        return false;
+    for (size_t i = 0; i < NOB_ARRAY_LEN(wl_protocols); i++) {
+        const char *xml = wl_protocols[i][0];
+        const char *base = wl_protocols[i][1];
+        const char *hdr = temp_sprintf("%s/%s-client-protocol.h", WLWP_GEN_DIR, base);
+        const char *src = temp_sprintf("%s/%s-protocol.c", WLWP_GEN_DIR, base);
+        const char *ins[] = {xml};
+        int need_h = needs_rebuild(hdr, ins, 1);
+        int need_c = needs_rebuild(src, ins, 1);
+        if (need_h < 0 || need_c < 0)
+            return false;
+        if (need_h) {
+            nob_log(NOB_INFO, "wayland-scanner client-header %s", base);
+            Cmd cmd = {0};
+            cmd_append(&cmd, "wayland-scanner", "client-header", xml, hdr);
+            if (!cmd_run(&cmd))
+                return false;
+        }
+        if (need_c) {
+            nob_log(NOB_INFO, "wayland-scanner private-code %s", base);
+            Cmd cmd = {0};
+            cmd_append(&cmd, "wayland-scanner", "private-code", xml, src);
+            if (!cmd_run(&cmd))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool build_goo_wlwp(void) {
+    if (!mkdir_if_not_exists(BIN_DIR))
+        return false;
+
+    File_Paths inputs = {0};
+    for (size_t i = 0; i < NOB_ARRAY_LEN(wlwp_sources); i++)
+        da_append(&inputs, wlwp_sources[i]);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(shaders); i++)
+        da_append(&inputs, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
+    for (size_t i = 0; i < NOB_ARRAY_LEN(wl_protocols); i++) {
+        da_append(&inputs, temp_sprintf("%s/%s-client-protocol.h", WLWP_GEN_DIR, wl_protocols[i][1]));
+        da_append(&inputs, temp_sprintf("%s/%s-protocol.c", WLWP_GEN_DIR, wl_protocols[i][1]));
+    }
+    da_append(&inputs, "sim.h");
+    da_append(&inputs, "shader.h");
+    da_append(&inputs, "buffer.h");
+    da_append(&inputs, "lib/gl.h");
+    da_append(&inputs, "lib/dropt.h");
+    da_append(&inputs, "lib/ini.h");
+    da_append(&inputs, DEFAULT_PARAMS_HDR);
+    int needed = needs_rebuild(wlwp_bin_path, inputs.items, inputs.count);
+    da_free(inputs);
+    if (needed < 0)
+        return false;
+    if (!needed) {
+        nob_log(NOB_INFO, "%s up to date", wlwp_bin_path);
+        return true;
+    }
+
+    Cmd cmd = {0};
+    nob_cc(&cmd);
+    cmd_append(&cmd, "-O3");
+    cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR, "-I" WLWP_GEN_DIR);
+    cmd_append(&cmd, "-o", wlwp_bin_path);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(wlwp_sources); i++)
+        cmd_append(&cmd, wlwp_sources[i]);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(wl_protocols); i++)
+        cmd_append(&cmd, temp_sprintf("%s/%s-protocol.c", WLWP_GEN_DIR, wl_protocols[i][1]));
+    cmd_append(&cmd, "-lwayland-client", "-lwayland-egl", "-lEGL", "-lGL", "-lm");
+    return cmd_run(&cmd);
+}
+
 static bool build_goo(void) {
     if (!mkdir_if_not_exists(BIN_DIR))
         return false;
@@ -186,6 +320,7 @@ static bool build_goo(void) {
         da_append(&inputs, sources[i]);
     for (size_t i = 0; i < NOB_ARRAY_LEN(shaders); i++)
         da_append(&inputs, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
+    da_append(&inputs, "sim.h");
     da_append(&inputs, "shader.h");
     da_append(&inputs, "buffer.h");
     da_append(&inputs, "lib/RGFW.h");
@@ -241,12 +376,13 @@ static bool format_sources(void) {
 }
 
 static void usage(const char *program) {
-    nob_log(NOB_INFO, "usage: %s [build|run|clean|format|help]", program);
-    nob_log(NOB_INFO, "  build   compile to %s", bin_path);
-    nob_log(NOB_INFO, "  run     build and run");
-    nob_log(NOB_INFO, "  clean   remove %s/ and generated %s/*.h", BIN_DIR, SHADER_DIR);
-    nob_log(NOB_INFO, "  format  clang-format top-level *.c/*.h (skips lib/)");
-    nob_log(NOB_INFO, "  help    (default) show this message");
+    nob_log(NOB_INFO, "usage: %s [build|build-wlwp|run|clean|format|help]", program);
+    nob_log(NOB_INFO, "  build       compile to %s", bin_path);
+    nob_log(NOB_INFO, "  build-wlwp  compile the wayland wallpaper to %s (linux only)", wlwp_bin_path);
+    nob_log(NOB_INFO, "  run         build and run");
+    nob_log(NOB_INFO, "  clean       remove %s/ and generated headers", BIN_DIR);
+    nob_log(NOB_INFO, "  format      clang-format top-level *.c/*.h (skips lib/)");
+    nob_log(NOB_INFO, "  help        (default) show this message");
 }
 
 int main(int argc, char **argv) {
@@ -269,11 +405,27 @@ int main(int argc, char **argv) {
             cmd_append(&cmd, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
         }
         cmd_append(&cmd, DEFAULT_PARAMS_HDR); // generated default config tokens
+        cmd_append(&cmd, "-r", WLWP_GEN_DIR);  // generated wayland protocol glue
         return cmd_run(&cmd) ? 0 : 1;
     }
 
     if (strcmp(target, "format") == 0) {
         return format_sources() ? 0 : 1;
+    }
+
+    // The wayland wallpaper binary. Separate target: linux + wayland/egl only, with
+    // its own dep check + protocol codegen. The shared sim still needs the shader +
+    // default-param headers, hence the same generate_* preamble.
+    if (strcmp(target, "build-wlwp") == 0) {
+        if (!check_wlwp_deps())
+            return 1;
+        if (!generate_shaders())
+            return 1;
+        if (!generate_default_params())
+            return 1;
+        if (!generate_wl_protocols())
+            return 1;
+        return build_goo_wlwp() ? 0 : 1;
     }
 
     if (strcmp(target, "build") != 0 && strcmp(target, "run") != 0) {
