@@ -89,7 +89,7 @@ extern int trail_width, trail_height;
 extern int P;
 
 // --gl-refresh <dur>: how often (seconds) to recreate the GL context to reclaim
-// the freedreno per-submit leak (see debug/). 0 = never. wallpaper front-end only.
+// the freedreno per-submit leak (see debug/). default 30m; 0 = never. wallpaper only.
 extern double gl_refresh_seconds;
 
 // tile-coherent draw order

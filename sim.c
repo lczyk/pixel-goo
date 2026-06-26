@@ -179,7 +179,7 @@ int P = 200000; // --particles
 double pass_ms[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 const char *pass_name[8] = {"vel", "pos", "dens", "trail", "scr", "up", "rdbk", "sort"};
 
-double gl_refresh_seconds = 0; // --gl-refresh: GL-context recreate cadence (0 = off); wallpaper only
+double gl_refresh_seconds = 30 * 60; // --gl-refresh: GL-context recreate cadence (default 30m; 0 = off); wallpaper only
 
 // When set (via sim_restore), the next buffer_setup uploads this saved state
 // instead of generating a fresh random field. Consumed (cleared) by buffer_setup.
@@ -682,7 +682,7 @@ void parse_args(int argc, char **argv, bool wlwp) {
     // Wallpaper-only options: only meaningful for the wayland layer-shell front-end.
     dropt_option wlwp_opts[] = {
         {'\0', NULL, "\nWALLPAPER", NULL, NULL, NULL},
-        {'\0', "gl-refresh", "Recreate the GL context every <dur> (s/m/h/d, e.g. 30m; 0 = never) to reclaim the freedreno driver leak. See debug/.", "DUR",
+        {'\0', "gl-refresh", "Recreate the GL context every <dur> (s/m/h/d; default 30m; 0 = never) to reclaim the freedreno driver leak. See debug/.", "DUR",
          parse_duration, &gl_refresh_seconds},
     };
 
