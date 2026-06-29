@@ -176,6 +176,7 @@ int main(int argc, char **argv) {
         // the other front-ends. The cursor maps from whichever target screen it's over
         // into the shared sim coords, so repel works on every cloned monitor.
         float prev_mouse[2] = {-1e9f, -1e9f};
+        NSUInteger prev_hit = (NSUInteger)-1; // which screen the cursor was on last frame
 
         int epoch_counter = 0;
         while (running) {
@@ -200,12 +201,14 @@ int main(int argc, char **argv) {
                     // screen it's on into the shared sim coords -- not just the reference.
                     NSRect hit = ref_frame;
                     bool in = false;
+                    NSUInteger hit_idx = (NSUInteger)-1;
                     for (NSUInteger i = 0; i < nwin; i++) {
                         NSRect f = [[screens objectAtIndex:i] frame];
                         if (m.x >= f.origin.x && m.x < f.origin.x + f.size.width &&
                             m.y >= f.origin.y && m.y < f.origin.y + f.size.height) {
                             hit = f;
                             in = true;
+                            hit_idx = i;
                             break;
                         }
                     }
@@ -217,13 +220,16 @@ int main(int argc, char **argv) {
                         mouse_position[0] = (float)lx * mouse_scale;
                         // sim space is top-origin; cocoa screen y is bottom-up -- flip.
                         mouse_position[1] = (float)(logical_h - ly_bottom) * mouse_scale;
-                        // velocity only if the previous frame was also on-screen -- else the
-                        // delta is the teleport from the parked sentinel (re-entry jump).
-                        if (prev_mouse[0] > -1e8f) {
+                        // velocity only if the previous frame was on the same screen -- else
+                        // the delta is a teleport: either re-entry from the parked sentinel,
+                        // or a screen-cross (every monitor clones the field, so the fraction
+                        // snaps from one screen edge to the opposite edge of the shared sim).
+                        if (prev_mouse[0] > -1e8f && hit_idx == prev_hit) {
                             mouse_velocity[0] = mouse_position[0] - prev_mouse[0];
                             mouse_velocity[1] = mouse_position[1] - prev_mouse[1];
                         }
                     }
+                    prev_hit = hit_idx;
                 }
                 prev_mouse[0] = mouse_position[0];
                 prev_mouse[1] = mouse_position[1];
