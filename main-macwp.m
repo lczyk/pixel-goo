@@ -173,8 +173,8 @@ int main(int argc, char **argv) {
 
         // Mouse repel: ignoresMouseEvents means no pointer events, so poll the global
         // cursor each frame (no input steal) and feed its per-frame velocity, same as
-        // the other front-ends. NOTE: repel tracks the reference screen only (the sim
-        // lives in its coords); the cursor over a cloned monitor parks the repel.
+        // the other front-ends. The cursor maps from whichever target screen it's over
+        // into the shared sim coords, so repel works on every cloned monitor.
         float prev_mouse[2] = {-1e9f, -1e9f};
 
         int epoch_counter = 0;
@@ -195,10 +195,25 @@ int main(int argc, char **argv) {
                 float mouse_velocity[2] = {0.0f, 0.0f};
                 if (!no_mouse) {
                     NSPoint m = [NSEvent mouseLocation]; // screen coords, bottom-left origin
-                    double lx = m.x - ref_frame.origin.x;
-                    double ly_bottom = m.y - ref_frame.origin.y;
-                    bool in = lx >= 0 && lx < logical_w && ly_bottom >= 0 && ly_bottom < logical_h;
+                    // Find the target screen under the cursor. In clone mode every monitor
+                    // shows the same field, so map the cursor as a fraction of whichever
+                    // screen it's on into the shared sim coords -- not just the reference.
+                    NSRect hit = ref_frame;
+                    bool in = false;
+                    for (NSUInteger i = 0; i < nwin; i++) {
+                        NSRect f = [[screens objectAtIndex:i] frame];
+                        if (m.x >= f.origin.x && m.x < f.origin.x + f.size.width &&
+                            m.y >= f.origin.y && m.y < f.origin.y + f.size.height) {
+                            hit = f;
+                            in = true;
+                            break;
+                        }
+                    }
                     if (in) {
+                        // fraction within the hit screen -> shared logical coords (stretched
+                        // for monitors of a different size, same as the visual upscale).
+                        double lx = (m.x - hit.origin.x) / hit.size.width * logical_w;
+                        double ly_bottom = (m.y - hit.origin.y) / hit.size.height * logical_h;
                         mouse_position[0] = (float)lx * mouse_scale;
                         // sim space is top-origin; cocoa screen y is bottom-up -- flip.
                         mouse_position[1] = (float)(logical_h - ly_bottom) * mouse_scale;
