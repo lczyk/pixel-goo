@@ -115,7 +115,9 @@ void dump_ppm_scalar(const char *path, int w, int h, GLuint fbo);
 // parse cli + config into the globals. wlwp = true drops the window-only flags
 // (monitor/width/height/fps/mouse/headless/...) from both the option table and the
 // baked-in defaults, so goo-wlwp only exposes flags that concern a wallpaper.
-void parse_args(int argc, char **argv, bool wlwp);
+// wlwp = wallpaper build (drops window-only flags). macwp additionally exposes -m
+// (monitor index; -1 = clone to all monitors) -- only the macos wallpaper uses it.
+void parse_args(int argc, char **argv, bool wlwp, bool macwp);
 void shader_setup(void);
 void buffer_setup(void);
 void updateShaderWindowShape(int width, int height);

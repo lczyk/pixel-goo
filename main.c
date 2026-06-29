@@ -21,7 +21,7 @@ void window_setup(void);
 void handle_framebuffer_resize(int width, int height);
 
 int main(int argc, char **argv) {
-    parse_args(argc, argv, false);
+    parse_args(argc, argv, false, false);
 
     // Headless needs a fixed frame count and ffmpeg to pipe into. Check both before any
     // GL/window/sim init, so a bad invocation fails instantly rather than after setup.

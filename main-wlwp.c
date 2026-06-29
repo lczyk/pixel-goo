@@ -271,7 +271,7 @@ static void gl_refresh(void) {
 }
 
 int main(int argc, char **argv) {
-    parse_args(argc, argv, true);
+    parse_args(argc, argv, true, false);
 
     display = wl_display_connect(NULL);
     if (!display)

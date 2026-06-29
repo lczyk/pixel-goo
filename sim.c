@@ -540,7 +540,7 @@ static bool is_window_only(const char *name) {
 
 // Parse command-line options into the runtime globals above. Exits the process
 // on --help or on a bad option; returns normally to let the sim start.
-void parse_args(int argc, char **argv, bool wlwp) {
+void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
     dropt_bool show_help = 0;
     dropt_bool windowed = 0;
     dropt_bool no_vsync = 0;
@@ -686,11 +686,21 @@ void parse_args(int argc, char **argv, bool wlwp) {
          parse_duration, &gl_refresh_seconds},
     };
 
-    // Assemble the final table: core + (wallpaper-only if wlwp, else window-only) + sentinel.
+    // macos-wallpaper-only options: the wayland wallpaper is single-output, so -m
+    // (clone to a monitor / all monitors) only makes sense for goo-macwp.
+    dropt_option macwp_opts[] = {
+        {'\0', NULL, "\nWALLPAPER", NULL, NULL, NULL},
+        {'m', "monitor", "Monitor to render the wallpaper on (-1 = clone to all monitors; default 0 = main).", "N",
+         parse_int, &whichMonitor},
+    };
+
+    // Assemble the final table: core + flavor-specific extras + sentinel.
     size_t n_core = sizeof core_opts / sizeof core_opts[0];
-    dropt_option *extra = wlwp ? wlwp_opts : win_opts;
-    size_t n_extra = wlwp ? sizeof wlwp_opts / sizeof wlwp_opts[0]
-                          : sizeof win_opts / sizeof win_opts[0];
+    dropt_option *extra = macwp ? macwp_opts : wlwp ? wlwp_opts
+                                                    : win_opts;
+    size_t n_extra = macwp ? sizeof macwp_opts / sizeof macwp_opts[0]
+                           : wlwp ? sizeof wlwp_opts / sizeof wlwp_opts[0]
+                                  : sizeof win_opts / sizeof win_opts[0];
     dropt_option *options = malloc((n_core + n_extra + 1) * sizeof(dropt_option));
     if (!options) {
         fprintf(stderr, "goo: out of memory setting up option parser\n");
@@ -700,7 +710,8 @@ void parse_args(int argc, char **argv, bool wlwp) {
     memcpy(options + n_core, extra, n_extra * sizeof(dropt_option));
     memset(options + n_core + n_extra, 0, sizeof(dropt_option)); // sentinel
 
-    const char *prog = wlwp ? "goo-wlwp" : "goo";
+    const char *prog = macwp ? "goo-macwp" : wlwp ? "goo-wlwp"
+                                                  : "goo";
 
     dropt_context *ctx = dropt_new_context(options);
     if (ctx == NULL) {

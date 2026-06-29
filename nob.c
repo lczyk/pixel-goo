@@ -26,6 +26,14 @@ exec ./bin/nob "$@"
 
 static const char *bin_path = BIN_DIR "/goo";
 static const char *wlwp_bin_path = BIN_DIR "/goo-wlwp";
+static const char *macwp_bin_path = BIN_DIR "/goo-macwp";
+
+static const char *macwp_sources[] = {
+    "main-macwp.m",
+    "sim.c",
+    "shader.c",
+    "buffer.c",
+};
 
 #define WLWP_GEN_DIR "wlwp" // generated wayland protocol glue (gitignored)
 
@@ -308,6 +316,51 @@ static bool build_goo_wlwp(void) {
     return cmd_run(&cmd);
 }
 
+// The macos desktop-wallpaper binary. Separate target: macos-only (Cocoa +
+// NSOpenGL). No protocol codegen like wlwp -- just the shared sim + the obj-c
+// front-end. Frameworks are the same set build_goo links (add_platform_libs).
+static bool build_goo_macwp(void) {
+#if !defined(__APPLE__)
+    nob_log(NOB_ERROR, "build-macwp is macos-only (Cocoa wallpaper window). this is not macos.");
+    return false;
+#else
+    if (!mkdir_if_not_exists(BIN_DIR))
+        return false;
+
+    File_Paths inputs = {0};
+    for (size_t i = 0; i < NOB_ARRAY_LEN(macwp_sources); i++)
+        da_append(&inputs, macwp_sources[i]);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(shaders); i++)
+        da_append(&inputs, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
+    da_append(&inputs, "sim.h");
+    da_append(&inputs, "shader.h");
+    da_append(&inputs, "buffer.h");
+    da_append(&inputs, "lib/gl.h");
+    da_append(&inputs, "lib/dropt.h");
+    da_append(&inputs, "lib/ini.h");
+    da_append(&inputs, DEFAULT_PARAMS_HDR);
+    int needed = needs_rebuild(macwp_bin_path, inputs.items, inputs.count);
+    da_free(inputs);
+    if (needed < 0)
+        return false;
+    if (!needed) {
+        nob_log(NOB_INFO, "%s up to date", macwp_bin_path);
+        return true;
+    }
+
+    Cmd cmd = {0};
+    nob_cc(&cmd);
+    cmd_append(&cmd, "-O3");
+    cmd_append(&cmd, "-DGL_SILENCE_DEPRECATION"); // OpenGL is deprecated on macos but works; mute the noise
+    cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR);
+    cmd_append(&cmd, "-o", macwp_bin_path);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(macwp_sources); i++)
+        cmd_append(&cmd, macwp_sources[i]);
+    add_platform_libs(&cmd);
+    return cmd_run(&cmd);
+#endif
+}
+
 static bool build_goo(void) {
     if (!mkdir_if_not_exists(BIN_DIR))
         return false;
@@ -379,6 +432,7 @@ static void usage(const char *program) {
     nob_log(NOB_INFO, "usage: %s [build|build-wlwp|run|clean|format|help]", program);
     nob_log(NOB_INFO, "  build       compile to %s", bin_path);
     nob_log(NOB_INFO, "  build-wlwp  compile the wayland wallpaper to %s (linux only)", wlwp_bin_path);
+    nob_log(NOB_INFO, "  build-macwp compile the macos wallpaper to %s (macos only)", macwp_bin_path);
     nob_log(NOB_INFO, "  run         build and run");
     nob_log(NOB_INFO, "  clean       remove %s/ and generated headers", BIN_DIR);
     nob_log(NOB_INFO, "  format      clang-format top-level *.c/*.h (skips lib/)");
@@ -426,6 +480,16 @@ int main(int argc, char **argv) {
         if (!generate_wl_protocols())
             return 1;
         return build_goo_wlwp() ? 0 : 1;
+    }
+
+    // The macos wallpaper binary. Separate target: macos-only. Shares the sim, so
+    // it still needs the shader + default-param header codegen.
+    if (strcmp(target, "build-macwp") == 0) {
+        if (!generate_shaders())
+            return 1;
+        if (!generate_default_params())
+            return 1;
+        return build_goo_macwp() ? 0 : 1;
     }
 
     if (strcmp(target, "build") != 0 && strcmp(target, "run") != 0) {
