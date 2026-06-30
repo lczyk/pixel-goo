@@ -1203,6 +1203,10 @@ void sim_resize(int logical_w, int logical_h, int fb_w, int fb_h) {
     density_width = width / densityBufferDownsampling + 1;
     density_height = height / densityBufferDownsampling + 1;
     buffer_reallocate(&densityBuffer, current, density_width, density_height);
+    // Grow the readback scratch too -- glReadPixels writes density_width*density_height
+    // floats into it, so a grow-resize overflows the setup-sized buffer (same class as
+    // the sort_counts realloc below). Same generous +8 padding as buffer_setup.
+    density_readback = (float *)realloc(density_readback, (size_t)(density_width + 8) * (density_height + 8) * sizeof(float));
     trail_width = width / trailBufferDownsampling + 1;
     trail_height = height / trailBufferDownsampling + 1;
     buffer_reallocate(&trailBuffer, current, trail_width, trail_height);
