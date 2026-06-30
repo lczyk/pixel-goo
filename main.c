@@ -17,6 +17,20 @@
 
 RGFW_window *window;
 
+// Actual GL drawable size in device px -- the present viewport / upscale target.
+// NOTE: only macos has a separate backing store where getSizeInPixels is the real
+// drawable size. on x11/xwayland/wayland RGFW never applies a buffer scale, so the
+// drawable is the logical window size -- getSizeInPixels inflates by the monitor dpi
+// ratio and would set a viewport larger than the actual buffer (rendering into one
+// quadrant under hidpi gnome). use the logical size there.
+static void window_drawable_px(i32 *w, i32 *h) {
+#ifdef RGFW_MACOS
+    RGFW_window_getSizeInPixels(window, w, h);
+#else
+    RGFW_window_getSize(window, w, h);
+#endif
+}
+
 void window_setup(void);
 void handle_framebuffer_resize(int width, int height);
 
@@ -158,7 +172,7 @@ int main(int argc, char **argv) {
 #endif
             {
                 i32 fbw = 0, fbh = 0;
-                RGFW_window_getSizeInPixels(window, &fbw, &fbh);
+                window_drawable_px(&fbw, &fbh);
                 window_width = fbw;
                 window_height = fbh;
                 screenBuffer.width = window_width;
@@ -404,8 +418,8 @@ void window_setup(void) {
 #endif
 
     i32 fb_width, fb_height, logical_width, logical_height;
-    RGFW_window_getSizeInPixels(window, &fb_width, &fb_height);
     RGFW_window_getSize(window, &logical_width, &logical_height);
+    window_drawable_px(&fb_width, &fb_height);
     sim_set_dims(logical_width, logical_height, fb_width, fb_height);
 
     // Quit when escape is pressed (reported through RGFW_window_shouldClose)
@@ -432,7 +446,7 @@ void handle_framebuffer_resize(int new_width, int new_height) {
     (void)new_width;
     (void)new_height;
     i32 fb_width, fb_height, logical_width, logical_height;
-    RGFW_window_getSizeInPixels(window, &fb_width, &fb_height);
     RGFW_window_getSize(window, &logical_width, &logical_height);
+    window_drawable_px(&fb_width, &fb_height);
     sim_resize(logical_width, logical_height, fb_width, fb_height);
 }
