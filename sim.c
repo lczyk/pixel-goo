@@ -1195,8 +1195,37 @@ void sim_set_dims(int logical_w, int logical_h, int fb_w, int fb_h) {
     dpi_scale = (logical_w > 0) ? (float)fb_w / (float)logical_w : 1.0f;
 }
 
+// On resize the sim coordinate space (sim_width/height) changes, but the particle
+// positions stored in positionBuffer don't -- left as-is they stay clumped in a corner
+// of the new (usually larger) field and only slowly diffuse out to fill it. Scale every
+// stored position by the size ratio so the field keeps filling the window immediately.
+// Readback + reupload on the cpu: resizes are rare, so the cost is irrelevant, and it
+// avoids standing up a dedicated scale shader pass. velocities are left unscaled -- they
+// re-equilibrate within a few frames and the visible artefact is purely positional.
+static void rescale_positions(float kx, float ky) {
+    int n = PB_width * PB_height;
+    float *p = (float *)malloc((size_t)n * 2 * sizeof(float));
+    if (!p)
+        return;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, positionBuffer.framebuffers[positionBuffer.current]);
+    glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, p);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    for (int i = 0; i < n; i++) {
+        p[i * 2] *= kx;
+        p[i * 2 + 1] *= ky;
+    }
+    // keep textures[i] bound to unit i (the convention buffer_allocate sets up).
+    glActiveTexture(GL_TEXTURE0 + positionBuffer.current);
+    glBindTexture(GL_TEXTURE_2D, positionBuffer.textures[positionBuffer.current]);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, p);
+    free(p);
+}
+
 void sim_resize(int logical_w, int logical_h, int fb_w, int fb_h) {
+    int old_sim_w = sim_width, old_sim_h = sim_height;
     sim_set_dims(logical_w, logical_h, fb_w, fb_h);
+    if (old_sim_w > 0 && old_sim_h > 0 && (sim_width != old_sim_w || sim_height != old_sim_h))
+        rescale_positions((float)sim_width / (float)old_sim_w, (float)sim_height / (float)old_sim_h);
     glViewport(0, 0, window_width, window_height);
     updateShaderWindowShape(width, height);
     buffer_reallocate(&renderBuffer, current, width, height);
