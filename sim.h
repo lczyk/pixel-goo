@@ -37,6 +37,7 @@ extern bool no_keyfocus_steal;
 extern bool no_border;
 extern bool no_mouse;
 extern bool mouse_debug;
+extern bool corners_debug;
 extern char *dump_path;
 extern char *headless_path;
 extern FILE *ffmpeg_pipe;

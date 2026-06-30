@@ -62,6 +62,7 @@ bool no_keyfocus_steal = false;    // --no-keyfocus-steal: show window w/out gra
 bool no_border = false;            // --no-border: hide the title bar / border in windowed mode
 bool no_mouse = false;             // --no-mouse: disable the mouse repel (park the cursor far off)
 bool mouse_debug = false;          // --mouse-debug: draw green dot + trail at cursor
+bool corners_debug = false;        // --corners-debug: draw green squares in the window corners
 char *dump_path = NULL;            // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
 char *headless_path = NULL;        // --headless <out>: pipe raw render-res frames to ffmpeg, no window present
 FILE *ffmpeg_pipe = NULL;          // popen handle for the headless encode
@@ -530,7 +531,7 @@ static const char *token_flag_name(const char *tok, char *out, size_t cap) {
 static bool is_window_only(const char *name) {
     static const char *w[] = {
         "monitor", "windowed", "no-border", "width", "height", "fps",
-        "mouse-debug", "no-keyfocus-steal", "profile", "warmup",
+        "mouse-debug", "corners-debug", "no-keyfocus-steal", "profile", "warmup",
         "dump", "headless"};
     for (size_t i = 0; i < sizeof w / sizeof w[0]; i++)
         if (strcmp(name, w[i]) == 0)
@@ -664,6 +665,8 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         {'\0', NULL, "\nDEBUG / BENCHMARK", NULL, NULL, NULL},
         {'\0', "mouse-debug", "Draw a green dot and trail at the cursor position.", NULL,
          dropt_handle_bool, &mouse_debug},
+        {'\0', "corners-debug", "Draw green squares in the window corners (debug viewport mapping).", NULL,
+         dropt_handle_bool, &corners_debug},
         {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
          dropt_handle_bool, &prof},
         {'\0', "warmup", "Simulate N frames before presenting -- skips the boring startup ramp (both windowed + headless).", "N",

@@ -17,12 +17,12 @@
 
 RGFW_window *window;
 
-// Actual GL drawable size in device px -- the present viewport / upscale target.
+// Actual GL framebuffer size in device px -- the present viewport / upscale target.
 // NOTE: only macos has a separate backing store where getSizeInPixels is the real
-// drawable size. on x11/xwayland/wayland RGFW never applies a buffer scale, so the
-// drawable is the logical window size -- getSizeInPixels inflates by the monitor dpi
-// ratio and would set a viewport larger than the actual buffer (rendering into one
-// quadrant under hidpi gnome). use the logical size there.
+// framebuffer size. on x11/xwayland/wayland RGFW never applies a buffer scale, so the
+// framebuffer is the logical window size -- getSizeInPixels inflates by the monitor dpi
+// ratio and oversizes the viewport (one quadrant in fullscreen, 3/4-black in windowed).
+// confirmed via --corners-debug: the real framebuffer == getSize in both modes.
 static void window_drawable_px(i32 *w, i32 *h) {
 #ifdef RGFW_MACOS
     RGFW_window_getSizeInPixels(window, w, h);
@@ -180,6 +180,25 @@ int main(int argc, char **argv) {
             }
 
             sim_present();
+
+            // Corners debug (--corners-debug): green squares at the 4 corners of what we
+            // believe is the window framebuffer (window_width/height). Tells us if the present
+            // viewport actually matches the visible window -- a corner you don't see means the
+            // assumed size overshoots the real framebuffer on that edge. scissor + clear, no
+            // shader. NOTE: leaves FB 0 bound (sim_present bound it) so it draws to the window.
+            if (corners_debug) {
+                const int s = 40; // square side, px
+                const int W = window_width, H = window_height;
+                const int corner[4][2] = {{0, 0}, {W - s, 0}, {0, H - s}, {W - s, H - s}};
+                glEnable(GL_SCISSOR_TEST);
+                glClearColor(0.0f, 1.0f, 0.0f, 1.0f);
+                for (int c = 0; c < 4; c++) {
+                    glScissor(corner[c][0], corner[c][1], s, s);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                }
+                glDisable(GL_SCISSOR_TEST);
+                glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // restore so the next frame's clears stay black
+            }
 
             // Mouse debug overlay: green dot at cursor + line from prev to current position.
             // Use raw logical window coords (xpos/ypos) so the overlay matches the actual cursor.
