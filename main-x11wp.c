@@ -1,13 +1,9 @@
 // RGFW front-end -> bin/goo-x11wp. x11 animated desktop wallpaper.
 //
-// Runs as a single borderless x11 window (RGFW x11 backend, same as bin/goo) marked
-// _NET_WM_WINDOW_TYPE_DESKTOP (+ skip taskbar/pager, sticky): any EWMH wm pins it at the wallpaper
-// layer, sticky, ignored by autotilers. So the window IS the wallpaper -- no extension, no install.
-// Primary target is gnome-wayland under XWayland (where layer-shell / goo-wlwp isn't available);
-// also runs on native x11. Not wayland-native on purpose: mutter mis-scales a native surface.
+// A borderless x11 window marked _NET_WM_WINDOW_TYPE_DESKTOP: an EWMH wm pins it at the wallpaper
+// layer, so the window IS the wallpaper -- no extension. Main target: gnome-wayland via XWayland.
 //
-// usage:
-//   goo-x11wp [--mouse] [goo options]   # --mouse: cursor repel (grabs pointer; no click-through)
+// usage: goo-x11wp [--mouse] [goo options]   (--mouse: cursor repel; disables click-through)
 //
 // The simulation itself lives in sim.c (see sim.h).
 
@@ -31,15 +27,14 @@
 
 static RGFW_window *window;
 static i32 g_fbw, g_fbh;            // initial framebuffer size in device px, captured at map
-static bool g_interactive = false; // --mouse: grab pointer input for the repel; else click-through, no repel
+static bool g_interactive = false; // --mouse: grab pointer for the repel; else click-through, no repel
 
 //============================================================
 // window
 //============================================================
 
-// Mark our window _NET_WM_WINDOW_TYPE_DESKTOP (+ skip taskbar/pager, sticky): an EWMH wm pins it at
-// the wallpaper layer, sticky across workspaces, ignored by autotilers. Must run before map -- the
-// wm reads the type then -- so the window is created hidden and shown after. No-op off x11.
+// Mark the window _NET_WM_WINDOW_TYPE_DESKTOP (+ skip taskbar/pager, sticky). Must run before map.
+// No-op off x11.
 static void set_desktop_window_type(void) {
     Display *dpy = (Display *)RGFW_getDisplay_X11();
     if (!dpy)
@@ -62,7 +57,7 @@ static void set_desktop_window_type(void) {
     XFlush(dpy);
 }
 
-// glad + context-level GL state. Split out so gl_refresh can rebuild it after recreating the context.
+// glad + context GL state. Split out so gl_refresh can rebuild it after recreating the context.
 static void gl_load_state(void) {
     if (!gladLoadGL((GLADloadfunc)RGFW_getProcAddress_OpenGL)) {
         fprintf(stderr, "goo-x11wp: failed to initialize GLAD\n");
@@ -76,7 +71,7 @@ static void gl_load_state(void) {
 static void window_setup(void) {
     RGFW_init();
 
-    // core 4.1 context (matches main.c; runs the "#version 330 core" shaders).
+    // core 4.1 (matches main.c; runs the "#version 330 core" shaders).
     RGFW_glHints *hints = RGFW_getGlobalHints_OpenGL();
     hints->major = 4;
     hints->minor = 1;
@@ -86,7 +81,7 @@ static void window_setup(void) {
     RGFW_windowFlags flags =
         RGFW_windowOpenGL | RGFW_windowNoBorder | RGFW_windowNoFocusOnCreate | RGFW_windowHide;
 
-    // NOTE: single-monitor (monitor 0). multi-monitor = one window per output; add when asked.
+    // NOTE: monitor 0 only; multi-monitor = one window per output.
     size_t monitorCount;
     RGFW_monitor **monitors = RGFW_getMonitors(&monitorCount);
     if (monitorCount == 0) {
@@ -103,22 +98,19 @@ static void window_setup(void) {
         exit(EXIT_FAILURE);
     }
 
-    RGFW_window_swapInterval_OpenGL(window, 0); // free-run (vsync off); --fps caps the spin
+    RGFW_window_swapInterval_OpenGL(window, 0); // free-run; --fps caps the spin
 
-    // set the desktop type, THEN map -- goo is the wallpaper directly.
-    set_desktop_window_type();
+    set_desktop_window_type(); // type before map, then show
     RGFW_window_show(window);
 
     if (!g_interactive) {
-        // click-through: clear the input region so desktop clicks fall through. --mouse skips it so
-        // goo gets the pointer for the repel (an empty input region also blinds XQueryPointer).
-        // NOTE: goo renders over the shell's desktop icons; a window can't sit below that layer.
+        // click-through: clear the input region so desktop clicks pass through. --mouse skips it
+        // (goo needs the pointer for the repel). NOTE: goo renders over the desktop icons.
         RGFW_window_setMousePassthrough(window, RGFW_TRUE);
     }
 
-    // Initial drawable (device px). getSize is the true gl drawable here (getSizeInPixels inflates
-    // on fractional XWayland). Provisional -- mutter resizes us a frame or two after map, so the
-    // loop re-reads getSize and resizes the sim to match.
+    // Initial drawable, device px (getSize; getSizeInPixels lies on fractional scale). The loop
+    // re-reads it -- the wm may resize us a frame or two after map.
     i32 fbw, fbh;
     RGFW_window_getSize(window, &fbw, &fbh);
     g_fbw = fbw;
@@ -129,9 +121,8 @@ static void window_setup(void) {
     gl_load_state();
 }
 
-// Recreate the GL context to reclaim the freedreno per-submit leak (see debug/, goo-wlwp's
-// --gl-refresh). Snapshot the sim (it lives in GL objects), delete+remake the context on the same
-// window (no remap/flash), rebuild the sim. Costs one frame's hitch.
+// Recreate the GL context to bound the freedreno per-submit leak (see goo-wlwp --gl-refresh).
+// Snapshot the sim, remake the context on the same window, rebuild. One frame's hitch.
 static void gl_refresh(void) {
     SimSnapshot *snap = sim_snapshot();
     sim_teardown_cpu();
@@ -145,9 +136,8 @@ static void gl_refresh(void) {
     sim_snapshot_free(snap);
 }
 
-// Global X pointer in device px relative to our drawable (caller applies mouse_scale for sim space,
-// like main.c). False when off our monitor / another screen. window_width/attr.width maps X coords
-// to device px whatever XWayland reports, so fractional scale needs no special case.
+// Global X pointer, device px relative to our drawable (caller scales to sim space). False when
+// off our monitor.
 static bool poll_mouse_px(float out[2]) {
     Display *dpy = (Display *)RGFW_getDisplay_X11();
     if (!dpy)
@@ -173,9 +163,8 @@ static bool poll_mouse_px(float out[2]) {
 //============================================================
 
 int main(int argc, char **argv) {
-    // --corners-debug / --mouse-debug / --mouse aren't in wlwp mode's option table (dropt would
-    // reject them). Consume + strip before parse_args. --mouse: interactive (repel, goo on top, no
-    // click-through). *-debug: green corners / cursor dot to check the sim maps 1:1.
+    // These flags aren't in wlwp mode's option table; consume + strip before parse_args.
+    // --mouse: interactive repel. *-debug: 1:1 check overlays.
     for (int i = 1; i < argc; i++) {
         bool strip = false;
         if (strcmp(argv[i], "--corners-debug") == 0)
@@ -192,8 +181,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    // wlwp=true reuses the wallpaper flag set. Side effect: --help says "goo-wlwp" and lists
-    // --gl-refresh. cosmetic; give x11wp its own parse_args mode if it grows real flags.
+    // wlwp=true reuses the wallpaper flag set. Side effect: --help says "goo-wlwp". cosmetic.
     parse_args(argc, argv, true, false);
 
     title = WIN_TITLE;
@@ -214,12 +202,10 @@ int main(int argc, char **argv) {
     double frame_ms = 0.0;
     double fps_sleep_ms = 0.0;
 
-    // --gl-refresh: periodic GL-context recreate to bound the freedreno leak (default 30m, shared
-    // with goo-wlwp via gl_refresh_seconds; 0 disables).
+    // --gl-refresh: bound the freedreno leak (default 30m, shared with goo-wlwp; 0 disables).
     double last_refresh = get_time();
 
-    // Mouse repel: global cursor -> sim space + per-frame velocity, like goo-wlwp. Parked ({-1e9,..})
-    // when off-monitor / --no-mouse / not --mouse; velocity only when the prev frame was also on.
+    // Mouse repel: global cursor -> sim space + velocity. Parked when off-monitor / not --mouse.
     float prev_mouse[2] = {-1e9f, -1e9f};
 
     while (!RGFW_window_shouldClose(window)) {
@@ -231,8 +217,7 @@ int main(int argc, char **argv) {
             last_refresh = get_time();
         }
 
-        // Track the real drawable: fractional-scaled XWayland resizes us a frame or two after map.
-        // getSize is the true gl drawable; resize the sim on change so we fill it, not a crop.
+        // the wm may resize us after map; resize the sim to the real drawable (fill, not crop).
         {
             i32 fbw, fbh;
             RGFW_window_getSize(window, &fbw, &fbh);
@@ -245,8 +230,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Global cursor -> sim space. Only in --mouse mode: with passthrough on, XQueryPointer is
-        // stale and would pin a repel bubble at a dead spot.
+        // poll only in --mouse mode: with passthrough on, XQueryPointer is stale (dead-spot bubble).
         float mouse_px[2] = {-1e9f, -1e9f};
         bool mouse_on = g_interactive && !no_mouse && poll_mouse_px(mouse_px);
         float mouse_position[2] = {-1e9f, -1e9f};
@@ -254,7 +238,7 @@ int main(int argc, char **argv) {
         if (mouse_on) {
             mouse_position[0] = mouse_px[0] * mouse_scale;
             mouse_position[1] = mouse_px[1] * mouse_scale;
-            if (prev_mouse[0] > -1e8f) { // skip the teleport delta on re-entry from the sentinel
+            if (prev_mouse[0] > -1e8f) { // skip the re-entry teleport delta
                 mouse_velocity[0] = mouse_position[0] - prev_mouse[0];
                 mouse_velocity[1] = mouse_position[1] - prev_mouse[1];
             }
@@ -265,8 +249,7 @@ int main(int argc, char **argv) {
         sim_step(epoch_counter, mouse_position, mouse_velocity);
         sim_present();
 
-        // --corners-debug: green squares at the 4 framebuffer corners -- a corner you don't see
-        // means the assumed size overshoots the real buffer there. scissor+clear over FB 0.
+        // --corners-debug: green squares at the 4 corners -- a missing one = viewport overshoot.
         if (corners_debug) {
             const int s = 40; // square side, px
             const int W = window_width, H = window_height;
@@ -281,7 +264,7 @@ int main(int argc, char **argv) {
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // restore so the next frame's clears stay black
         }
 
-        // --mouse-debug: green dot (+ trail) at where the sim sees the cursor -- confirms 1:1.
+        // --mouse-debug: green dot (+ trail) at where the sim sees the cursor.
         static float debug_prev[2] = {0.0f, 0.0f};
         if (mouse_debug && mouse_on) {
             float win_shape[2] = {(float)window_width, (float)window_height};
@@ -301,16 +284,14 @@ int main(int argc, char **argv) {
         if (epoch_counter % 120 == 0)
             fprintf(stdout, "frame=%.2f ms (%.0f fps)\n", frame_ms, frame_ms > 0 ? 1000.0 / frame_ms : 0);
 
-        // freedreno (tiled GPU): the compositor can sample mid tile-resolve, leaving stale tiles.
-        // glFinish forces resolve before commit. Serialises the frame -- fine at wallpaper fps.
-        glFinish();
+        glFinish(); // freedreno: force tile resolve before commit (else the compositor samples stale tiles)
         RGFW_window_swapBuffers_OpenGL(window);
 
-        RGFW_event event; // drain events (keeps the window responsive; getSize picks up WM resizes)
+        RGFW_event event; // drain events (responsive; getSize picks up resizes)
         while (RGFW_window_checkEvent(window, &event)) {
         }
 
-        if (fps_cap > 0) { // --fps soft cap: same proportional pacer as main.c
+        if (fps_cap > 0) { // --fps soft cap (proportional pacer)
             double target_ms = 1000.0 / fps_cap;
             fps_sleep_ms += (target_ms - frame_ms) * 0.5;
             if (fps_sleep_ms < 0.0)
