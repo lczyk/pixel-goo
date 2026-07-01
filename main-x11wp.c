@@ -1,12 +1,13 @@
-// RGFW front-end -> bin/goo-g50wp. gnome (gnome 50, wayland) animated desktop wallpaper.
+// RGFW front-end -> bin/goo-x11wp. x11 animated desktop wallpaper.
 //
-// Runs as a single borderless XWayland window (RGFW x11 backend, same as bin/goo) marked
-// _NET_WM_WINDOW_TYPE_DESKTOP: mutter pins it at the wallpaper layer, sticky across workspaces,
-// and autotilers ignore it. So the window IS the wallpaper -- no extension, no install step. Not
-// wayland-native on purpose: mutter mis-scales a native surface (rabbit hole); XWayland behaves.
+// Runs as a single borderless x11 window (RGFW x11 backend, same as bin/goo) marked
+// _NET_WM_WINDOW_TYPE_DESKTOP (+ skip taskbar/pager, sticky): any EWMH wm pins it at the wallpaper
+// layer, sticky, ignored by autotilers. So the window IS the wallpaper -- no extension, no install.
+// Primary target is gnome-wayland under XWayland (where layer-shell / goo-wlwp isn't available);
+// also runs on native x11. Not wayland-native on purpose: mutter mis-scales a native surface.
 //
 // usage:
-//   goo-g50wp [--mouse] [goo options]   # --mouse: cursor repel (grabs pointer; no click-through)
+//   goo-x11wp [--mouse] [goo options]   # --mouse: cursor repel (grabs pointer; no click-through)
 //
 // The simulation itself lives in sim.c (see sim.h).
 
@@ -26,7 +27,7 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 
-#define WIN_TITLE "goo-g50wp"
+#define WIN_TITLE "goo-x11wp"
 
 static RGFW_window *window;
 static i32 g_fbw, g_fbh;            // initial framebuffer size in device px, captured at map
@@ -36,9 +37,9 @@ static bool g_interactive = false; // --mouse: grab pointer input for the repel;
 // window
 //============================================================
 
-// Mark our window _NET_WM_WINDOW_TYPE_DESKTOP (+ skip taskbar/pager, sticky): mutter pins it at the
-// wallpaper layer, sticky across workspaces, ignored by autotilers. Must run before map -- mutter
-// reads the type then -- so the window is created hidden and shown after. No-op off x11.
+// Mark our window _NET_WM_WINDOW_TYPE_DESKTOP (+ skip taskbar/pager, sticky): an EWMH wm pins it at
+// the wallpaper layer, sticky across workspaces, ignored by autotilers. Must run before map -- the
+// wm reads the type then -- so the window is created hidden and shown after. No-op off x11.
 static void set_desktop_window_type(void) {
     Display *dpy = (Display *)RGFW_getDisplay_X11();
     if (!dpy)
@@ -64,7 +65,7 @@ static void set_desktop_window_type(void) {
 // glad + context-level GL state. Split out so gl_refresh can rebuild it after recreating the context.
 static void gl_load_state(void) {
     if (!gladLoadGL((GLADloadfunc)RGFW_getProcAddress_OpenGL)) {
-        fprintf(stderr, "goo-g50wp: failed to initialize GLAD\n");
+        fprintf(stderr, "goo-x11wp: failed to initialize GLAD\n");
         exit(EXIT_FAILURE);
     }
     glEnable(GL_PROGRAM_POINT_SIZE);
@@ -89,7 +90,7 @@ static void window_setup(void) {
     size_t monitorCount;
     RGFW_monitor **monitors = RGFW_getMonitors(&monitorCount);
     if (monitorCount == 0) {
-        fprintf(stderr, "goo-g50wp: no monitors found\n");
+        fprintf(stderr, "goo-x11wp: no monitors found\n");
         exit(EXIT_FAILURE);
     }
     RGFW_monitor *monitor = monitors[0];
@@ -98,7 +99,7 @@ static void window_setup(void) {
 
     window = RGFW_createWindow(WIN_TITLE, monitor->x, monitor->y, width, height, flags);
     if (!window) {
-        fprintf(stderr, "goo-g50wp: failed to create window\n");
+        fprintf(stderr, "goo-x11wp: failed to create window\n");
         exit(EXIT_FAILURE);
     }
 
@@ -122,7 +123,7 @@ static void window_setup(void) {
     RGFW_window_getSize(window, &fbw, &fbh);
     g_fbw = fbw;
     g_fbh = fbh;
-    printf("goo-g50wp: monitor 0 mode=%dx%d initial-drawable=%dx%d\n", monitor->mode.w, monitor->mode.h, fbw, fbh);
+    printf("goo-x11wp: monitor 0 mode=%dx%d initial-drawable=%dx%d\n", monitor->mode.w, monitor->mode.h, fbw, fbh);
     sim_set_dims(fbw, fbh, fbw, fbh);
 
     gl_load_state();
@@ -192,7 +193,7 @@ int main(int argc, char **argv) {
     }
 
     // wlwp=true reuses the wallpaper flag set. Side effect: --help says "goo-wlwp" and lists
-    // --gl-refresh. cosmetic; give g50wp its own parse_args mode if it grows real flags.
+    // --gl-refresh. cosmetic; give x11wp its own parse_args mode if it grows real flags.
     parse_args(argc, argv, true, false);
 
     title = WIN_TITLE;
