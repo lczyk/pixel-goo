@@ -27,6 +27,17 @@ exec ./bin/nob "$@"
 static const char *bin_path = BIN_DIR "/goo";
 static const char *wlwp_bin_path = BIN_DIR "/goo-wlwp";
 static const char *macwp_bin_path = BIN_DIR "/goo-macwp";
+static const char *g50wp_bin_path = BIN_DIR "/goo-g50wp";
+
+// gnome (gnome 50, wayland) wallpaper front-end. An XWayland desktop-type window mutter pins at
+// the wallpaper layer -- the window IS the wallpaper, no extension. Same libs as goo (x11).
+static const char *g50wp_sources[] = {
+    "main-g50wp.c",
+    "sim.c",
+    "shader.c",
+    "buffer.c",
+    "rgfw_impl.c",
+};
 
 static const char *macwp_sources[] = {
     "main-macwp.m",
@@ -401,6 +412,50 @@ static bool build_goo(void) {
     return cmd_run(&cmd);
 }
 
+// The gnome-wayland wallpaper binary. Same build as build_goo (x11 + GL libs), main.c ->
+// main-g50wp.c. No protocol codegen, no extension -- the window is the wallpaper directly.
+static bool build_goo_g50wp(void) {
+#if !defined(__linux__)
+    nob_log(NOB_ERROR, "build-g50wp is linux-only (gnome desktop wallpaper). this is not linux.");
+    return false;
+#else
+    if (!mkdir_if_not_exists(BIN_DIR))
+        return false;
+
+    File_Paths inputs = {0};
+    for (size_t i = 0; i < NOB_ARRAY_LEN(g50wp_sources); i++)
+        da_append(&inputs, g50wp_sources[i]);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(shaders); i++)
+        da_append(&inputs, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
+    da_append(&inputs, "sim.h");
+    da_append(&inputs, "shader.h");
+    da_append(&inputs, "buffer.h");
+    da_append(&inputs, "lib/RGFW.h");
+    da_append(&inputs, "lib/gl.h");
+    da_append(&inputs, "lib/dropt.h");
+    da_append(&inputs, "lib/ini.h");
+    da_append(&inputs, DEFAULT_PARAMS_HDR); // generated; sim.c pulls it in
+    int needed = needs_rebuild(g50wp_bin_path, inputs.items, inputs.count);
+    da_free(inputs);
+    if (needed < 0)
+        return false;
+    if (!needed) {
+        nob_log(NOB_INFO, "%s up to date", g50wp_bin_path);
+        return true;
+    }
+
+    Cmd cmd = {0};
+    nob_cc(&cmd);
+    cmd_append(&cmd, "-O3");
+    cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR, "-I.");
+    cmd_append(&cmd, "-o", g50wp_bin_path);
+    for (size_t i = 0; i < NOB_ARRAY_LEN(g50wp_sources); i++)
+        cmd_append(&cmd, g50wp_sources[i]);
+    add_platform_libs(&cmd);
+    return cmd_run(&cmd);
+#endif
+}
+
 #define CLANG_FORMAT_STYLE "{BasedOnStyle: llvm, IndentWidth: 4, ColumnLimit: 0}"
 
 // clang-format every top-level .c/.h in place. read_entire_dir is non-recursive,
@@ -429,10 +484,11 @@ static bool format_sources(void) {
 }
 
 static void usage(const char *program) {
-    nob_log(NOB_INFO, "usage: %s [build|build-wlwp|run|clean|format|help]", program);
+    nob_log(NOB_INFO, "usage: %s [build|build-wlwp|build-macwp|build-g50wp|run|clean|format|help]", program);
     nob_log(NOB_INFO, "  build       compile to %s", bin_path);
     nob_log(NOB_INFO, "  build-wlwp  compile the wayland wallpaper to %s (linux only)", wlwp_bin_path);
     nob_log(NOB_INFO, "  build-macwp compile the macos wallpaper to %s (macos only)", macwp_bin_path);
+    nob_log(NOB_INFO, "  build-g50wp compile the gnome-wayland wallpaper to %s (linux/gnome 50)", g50wp_bin_path);
     nob_log(NOB_INFO, "  run         build and run");
     nob_log(NOB_INFO, "  clean       remove %s/ and generated headers", BIN_DIR);
     nob_log(NOB_INFO, "  format      clang-format top-level *.c/*.h (skips lib/)");
@@ -459,7 +515,7 @@ int main(int argc, char **argv) {
             cmd_append(&cmd, temp_sprintf("%s/%s.h", SHADER_DIR, shaders[i]));
         }
         cmd_append(&cmd, DEFAULT_PARAMS_HDR); // generated default config tokens
-        cmd_append(&cmd, "-r", WLWP_GEN_DIR);  // generated wayland protocol glue
+        cmd_append(&cmd, "-r", WLWP_GEN_DIR); // generated wayland protocol glue
         return cmd_run(&cmd) ? 0 : 1;
     }
 
@@ -490,6 +546,16 @@ int main(int argc, char **argv) {
         if (!generate_default_params())
             return 1;
         return build_goo_macwp() ? 0 : 1;
+    }
+
+    // The gnome-wayland wallpaper binary. Shares the sim, so it still needs the shader +
+    // default-param header codegen.
+    if (strcmp(target, "build-g50wp") == 0) {
+        if (!generate_shaders())
+            return 1;
+        if (!generate_default_params())
+            return 1;
+        return build_goo_g50wp() ? 0 : 1;
     }
 
     if (strcmp(target, "build") != 0 && strcmp(target, "run") != 0) {
