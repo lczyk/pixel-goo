@@ -70,14 +70,13 @@ FILE *ffmpeg_pipe = NULL;          // popen handle for the headless encode
 unsigned char *headless_px = NULL; // reusable readback buffer (width*height*3)
 int rng_seed = 0;                  // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
 double init_warp = 0;              // --init-warp: magnitude of the perlin perturbation on initial positions (0 = pure uniform)
-double init_density = 0;           // --density/-d: particles per logical-pixel^2. DEFAULT oracle for P unless -p given. NaN (baked default) = unset -> r-scaled default (default_density_r) in parse_args.
-double default_density_r = 0;      // --default-density-r: density*render_scale invariant; default density = this/render_scale when --density unset
+double init_density = 0;           // --density/-d: particles per logical-pixel^2. DEFAULT oracle for P unless -p given.
 bool p_given = false;              // whether -p/--particles was passed -- if so it wins over --density
 int whichMonitor = 0;
 
 // Textures and framebuffers
-GLuint textures[9];
-GLuint framebuffers[9];
+GLuint textures[8];
+GLuint framebuffers[8];
 const PBindex densityBufferIndex = 0;
 const PBindex positionBufferIndex1 = 1;
 const PBindex positionBufferIndex2 = 2;
@@ -86,7 +85,6 @@ const PBindex velocityBufferIndex2 = 4;
 const PBindex trailBufferIndex1 = 5;
 const PBindex trailBufferIndex2 = 6;
 const PBindex renderBufferIndex = 7; // internal colour target, upscaled to the window
-const PBindex structureBufferIndex = 8; // gradient structure tensor of the density field (single buffer)
 
 // Physics buffer dims (square-ish texture holding P particles), set in buffer_setup.
 int PB_width = 0;
@@ -101,7 +99,6 @@ Shader densityShader = {.name = "densityShader"};
 Shader positionShader = {.name = "positionShader"};
 Shader velocityShader = {.name = "velocityShader"};
 Shader copyShader = {.name = "copyShader"};
-Shader structureShader = {.name = "structureShader"};
 Shader trailShader = {.name = "trailShader"};
 Shader upscaleShader = {.name = "upscaleShader"};
 Shader debugShader = {.name = "debugShader"};
@@ -112,13 +109,11 @@ Shader debugShader = {.name = "debugShader"};
 #include "density.h"
 #include "position.h"
 #include "screen.h"
-#include "structure.h"
 #include "trail.h"
 #include "upscale.h"
 #include "velocity.h"
 
 Buffer trailBuffer = {.name = "Trail Buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
-Buffer structureBuffer = {.name = "Structure Tensor Buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer positionBuffer = {.name = "Position buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer velocityBuffer = {.name = "Velocity buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer densityBuffer = {.name = "Density buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
@@ -136,12 +131,6 @@ double trailForce = 0;   // --trail-force: trail-gradient attract strength
 double edgeRepel = 0;    // --edge-repel: edge repulsion strength
 double densityReach = 0; // --dens-reach: density sampling radius (sim px)
 double trailReach = 0;   // --trail-reach: trail sampling radius (sim px)
-// Structure-tensor line-break. The gradient structure tensor of the instantaneous density field
-// detects local density lines/ridges; particles get pushed perpendicular (per-particle sign) to
-// dissolve them, gated by local density so voids are untouched. See structure.frag + velocity.frag.
-double lineForce = 0;    // --line-force: line-break push strength (0 = off)
-double lineWindow = 0;   // --line-window: structure-tensor box half-width (sim px)
-double lineCoherence = 0; // --line-coherence: min tensor coherence to push (0..1; below = no orientation)
 
 // The density/trail buffers are heavily downsampled, lerped physics fields -- not
 // the rendered image. Scattering every Nth particle into them (with the per-point
@@ -613,8 +602,6 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          parse_count, &P},
         {'d', "density", "Particles per logical-pixel^2 (sim-area + render-scale independent; default 0.05; excludes -p).", "F",
          parse_density, &init_density},
-        {'\0', "default-density-r", "density*render_scale invariant: default density = this/render_scale when --density unset.", "F",
-         dropt_handle_double, &default_density_r},
         {'\0', "init-warp", "Magnitude of the perlin warp on initial positions (0 = pure uniform; default 0.1).", "F",
          dropt_handle_double, &init_warp},
         {'\0', "drag", "Quadratic velocity damping coefficient (higher = more damping; default 0.11).", "F",
@@ -635,12 +622,6 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_double, &densityReach},
         {'\0', "trail-reach", "Trail force sampling radius in sim px (default 30).", "F",
          dropt_handle_double, &trailReach},
-        {'\0', "line-force", "Structure-tensor line-break push strength (spread density lines apart; 0 = off).", "F",
-         dropt_handle_double, &lineForce},
-        {'\0', "line-window", "Structure-tensor box half-width in sim px (line-detection scale; default 20).", "F",
-         dropt_handle_double, &lineWindow},
-        {'\0', "line-coherence", "Min structure-tensor coherence 0..1 to push (below = no orientation; default 0.5).", "F",
-         dropt_handle_double, &lineCoherence},
 
         {'\0', NULL, "\nCOLORMAP", NULL, NULL, NULL},
         {'\0', "gamma", "Colormap curve: 1 = linear/punchy, <1 lifts faint regions.", "F",
@@ -869,13 +850,6 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         exit(EXIT_FAILURE);
     }
 
-    // The ini bakes `density = nan` as an "unset by user" sentinel (an explicit -d/--density
-    // parses to a finite value and overrides it). When left unset, derive the default from the
-    // config's density*render_scale invariant (--default-density-r): density = invariant/render_scale,
-    // so it halves per doubling of -r (the ini can't express an r-dependent value directly).
-    if (isnan(init_density) && render_scale > 0.0)
-        init_density = default_density_r / render_scale;
-
     // --dump-params[=FORMAT]: every param is resolved now (and we're still before any window/GL
     // setup, since parse_args runs first). Print + exit. Only 'ini' format so far.
     if (dump_params_fmt != NULL) {
@@ -983,11 +957,6 @@ void shader_setup(void) {
     shader_compile(&copyShader, GL_VERTEX_SHADER, copy_VertexShaderSource);
     shader_compile(&copyShader, GL_FRAGMENT_SHADER, copy_FragmentShaderSource);
     shader_link(&copyShader);
-
-    shader_create(&structureShader);
-    shader_compile(&structureShader, GL_VERTEX_SHADER, structure_VertexShaderSource);
-    shader_compile(&structureShader, GL_FRAGMENT_SHADER, structure_FragmentShaderSource);
-    shader_link(&structureShader);
 
     shader_create(&trailShader);
     shader_compile(&trailShader, GL_VERTEX_SHADER, trail_VertexShaderSource);
@@ -1114,8 +1083,8 @@ void buffer_setup(void) {
     }
 
     // Initalise textures and the associated framebuffers
-    glGenTextures(9, textures);
-    glGenFramebuffers(9, framebuffers);
+    glGenTextures(8, textures);
+    glGenFramebuffers(8, framebuffers);
 
     // Texture 0 - Density buffer
     densityBuffer.minmag_filter = densityNearest ? GL_NEAREST : GL_LINEAR; // --dens-nearest for chunky pixels
@@ -1194,14 +1163,6 @@ void buffer_setup(void) {
     buffer_allocate(&trailBuffer, current, trailBufferIndex1, trail_width, trail_height,
                     restoring ? (const char *)g_restore->trail : NULL);
     buffer_allocate(&trailBuffer, other, trailBufferIndex2, trail_width, trail_height, NULL);
-
-    // Texture 8 - Structure tensor of the density field (RGB = Jxx,Jxy,Jyy). Single buffer (never
-    // flipped -- regenerated each update from the density field). Density-field resolution, GL_LINEAR
-    // so the per-particle sample interpolates smoothly.
-    structureBuffer.minmag_filter = GL_LINEAR;
-    structureBuffer.wrap_st = GL_REPEAT;
-    structureBuffer.dim = BE_3D;
-    buffer_allocate(&structureBuffer, current, structureBufferIndex, density_width, density_height, NULL);
 
     // Texture 7 - internal render target (rgba colour) at render resolution.
     // GL_NEAREST so the upscale to the window stays crisp/pixelated at low res.
@@ -1344,7 +1305,6 @@ void sim_resize(int logical_w, int logical_h, int fb_w, int fb_h) {
     trail_height = height / trailBufferDownsampling + 1;
     buffer_reallocate(&trailBuffer, current, trail_width, trail_height);
     buffer_reallocate(&trailBuffer, other, trail_width, trail_height);
-    buffer_reallocate(&structureBuffer, current, density_width, density_height);
     // sort_counts is sized by tile count, which grows with width/height -- resize it too,
     // else rebuild_sort_order writes past the end (sort_idx/sort_key are P-sized, stable).
     {
@@ -1382,16 +1342,6 @@ static void sim_apply_static_uniforms(void) {
     shader_set_uniform_float(&velocityShader, "density_reach", (float)densityReach);
     shader_set_uniform_float(&velocityShader, "trail_reach", (float)trailReach);
     shader_set_uniform_int(&velocityShader, "density_buffer", densityBuffer.current);
-    // Structure-tensor line-break. structure_buffer is single (never flips), so its index is
-    // static. The box half-width is a sim-px knob; convert sim px -> render px (SIM_SCALE/render_scale)
-    // -> density-buffer texels (/downsampling), floored at 1 texel.
-    shader_set_uniform_float(&velocityShader, "line_force", (float)lineForce);
-    shader_set_uniform_float(&velocityShader, "line_coherence", (float)lineCoherence);
-    shader_set_uniform_int(&velocityShader, "structure_buffer", structureBuffer.current);
-    int line_window_texels = (int)lround(lineWindow * (SIM_SCALE / render_scale) / densityBufferDownsampling);
-    if (line_window_texels < 1)
-        line_window_texels = 1;
-    shader_set_uniform_int(&structureShader, "window_radius", line_window_texels);
     // Trail spread-deposit (--trail-every N): the trail decays EVERY frame (smooth fade,
     // no frozen-field discontinuity), but each frame deposits only a rotating 1/N subset
     // of the trail particles. With the per-point intensity scaled by N, the per-frame
@@ -1509,17 +1459,6 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
         }
     }
     LAP(2);
-
-    // Structure-tensor pass: gradient structure tensor of the freshly-rebuilt density field.
-    // The box-average in the shader denoises; the current lines to break live here. Single
-    // non-separable draw into the (single) structure buffer; the velocity shader eigen-solves
-    // it per particle. Same cadence as the density rebuild.
-    if (lineForce != 0.0 && (dens_every <= 1 || epoch_counter % dens_every == 0)) {
-        shader_use(&structureShader);
-        shader_set_uniform_int(&structureShader, "density_src", densityBuffer.current);
-        buffer_bind(&structureBuffer, current);
-        buffer_update(&structureBuffer);
-    }
 
     // Trail buffer. Decay every frame (smooth), but deposit only a rotating 1/N
     // subset of the trail particles (--trail-every N), cycling the contiguous block

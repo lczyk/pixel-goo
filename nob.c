@@ -63,7 +63,7 @@ static const char *wlwp_sources[] = {
 };
 
 // Each shader has a .vert + .frag embedded into <name>.h by generate_shaders()
-static const char *shaders[] = {"copy", "debug", "density", "position", "screen", "structure", "trail", "upscale", "velocity"};
+static const char *shaders[] = {"copy", "debug", "density", "position", "screen", "trail", "upscale", "velocity"};
 
 static const char *sources[] = {
     "main.c",

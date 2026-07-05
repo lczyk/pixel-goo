@@ -32,9 +32,6 @@ uniform float trail_force;    // trail-gradient attract strength (was 0.07)
 uniform float edge_repell_coefficient; // edge repel strength (was 0.18)
 uniform float density_reach;  // density VDI sampling radius, sim px (was 20)
 uniform float trail_reach;    // trail VWI sampling radius, sim px (was 30)
-uniform sampler2D structure_buffer; // gradient structure tensor of the density field (Jxx,Jxy,Jyy)
-uniform float line_force;      // structure-tensor line-break strength (0 = off)
-uniform float line_coherence;  // min coherence to push (below = no real orientation, skip)
 uniform sampler2D position_buffer;
 uniform sampler2D velocity_buffer;
 
@@ -231,39 +228,6 @@ void main() {
         new_velocity -= density_force * density_integral;
         // new_velocity -= (1-density) * 0.02 * density_integral;
         // new_velocity -= (1-(1-density)*(1-density)) * 0.02 * density_integral;
-
-        // Structure-tensor line-break. structure_buffer holds the gradient structure tensor
-        // (Jxx,Jxy,Jyy) of the density field. Its MAJOR eigenvector points across any local
-        // density ridge/line, so pushing along it (with a per-particle sign) unzips the line into
-        // two clouds. coherence = (l1-l2)/(l1+l2) in [0,1] measures line-ness. Scaled by local
-        // density: the coherence ratio is scale-free, so in near-empty regions it's just gradient
-        // noise -- the density gate stops us shoving particles around the void. line_force==0 = off.
-        if (line_force > 0.0) {
-            vec3 J = texture(structure_buffer, textureNormalisedCoords(position)).xyz;
-            float half_tr = 0.5 * (J.x + J.z);
-            float disc = sqrt(0.25 * (J.x - J.z) * (J.x - J.z) + J.y * J.y);
-            float l1 = half_tr + disc; // major eigenvalue
-            float l2 = half_tr - disc; // minor eigenvalue
-            float sum = l1 + l2;
-            float coherence = (sum > 1e-8) ? (l1 - l2) / sum : 0.0;
-            // major eigenvector, trig-free. Both closed forms degenerate for axis-aligned
-            // tensors (one goes to zero), so pick the longer of the two.
-            vec2 e1 = vec2(J.y, l1 - J.x);
-            vec2 e2 = vec2(l1 - J.z, J.y);
-            vec2 evec = (dot(e1, e1) > dot(e2, e2)) ? e1 : e2;
-            float elen = length(evec);
-            // Coherence threshold: below it the texel is near-isotropic and the eigenvector is
-            // just noise (it collapses to a FIXED diagonal). Pushing there manufactures spurious
-            // uniform-direction streaks instead of breaking real lines -- so gate it out hard.
-            if (coherence > line_coherence && elen > 0.0) {
-                evec /= elen;
-                float side = sign(random_float(VertexID + 7.0)); // per-particle, deterministic
-                // sqrt softens the density gate: a thin high-contrast line fills only a fraction
-                // of a coarse density texel, so raw density under-reads it; sqrt lifts the low end
-                // while still zeroing true voids.
-                new_velocity += line_force * coherence * sqrt(density) * side * evec;
-            }
-        }
 #ifdef MOUSE_REPELL
     // }
 #endif /* MOUSE_REPELL */

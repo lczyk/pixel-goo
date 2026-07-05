@@ -49,8 +49,8 @@ extern bool p_given;
 extern int whichMonitor;
 
 // ---- gl objects / buffers ----
-extern GLuint textures[9];
-extern GLuint framebuffers[9];
+extern GLuint textures[8];
+extern GLuint framebuffers[8];
 extern const PBindex densityBufferIndex;
 extern const PBindex positionBufferIndex1;
 extern const PBindex positionBufferIndex2;
