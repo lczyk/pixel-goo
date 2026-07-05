@@ -64,18 +64,20 @@ bool no_mouse = false;             // --no-mouse: disable the mouse repel (park 
 bool mouse_debug = false;          // --mouse-debug: draw green dot + trail at cursor
 bool corners_debug = false;        // --corners-debug: draw green squares in the window corners
 char *dump_path = NULL;            // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
+const char *dump_params_fmt = NULL; // --dump-params[=FORMAT]: print resolved params and exit (NULL = don't)
 char *headless_path = NULL;        // --headless <out>: pipe raw render-res frames to ffmpeg, no window present
 FILE *ffmpeg_pipe = NULL;          // popen handle for the headless encode
 unsigned char *headless_px = NULL; // reusable readback buffer (width*height*3)
 int rng_seed = 0;                  // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
 double init_warp = 0;              // --init-warp: magnitude of the perlin perturbation on initial positions (0 = pure uniform)
-double init_density = 0;           // --density/-d: particles per logical-pixel^2. DEFAULT oracle for P unless -p given.
+double init_density = 0;           // --density/-d: particles per logical-pixel^2. DEFAULT oracle for P unless -p given. NaN (baked default) = unset -> r-scaled default (default_density_r) in parse_args.
+double default_density_r = 0;      // --default-density-r: density*render_scale invariant; default density = this/render_scale when --density unset
 bool p_given = false;              // whether -p/--particles was passed -- if so it wins over --density
 int whichMonitor = 0;
 
 // Textures and framebuffers
-GLuint textures[8];
-GLuint framebuffers[8];
+GLuint textures[9];
+GLuint framebuffers[9];
 const PBindex densityBufferIndex = 0;
 const PBindex positionBufferIndex1 = 1;
 const PBindex positionBufferIndex2 = 2;
@@ -84,6 +86,7 @@ const PBindex velocityBufferIndex2 = 4;
 const PBindex trailBufferIndex1 = 5;
 const PBindex trailBufferIndex2 = 6;
 const PBindex renderBufferIndex = 7; // internal colour target, upscaled to the window
+const PBindex structureBufferIndex = 8; // gradient structure tensor of the density field (single buffer)
 
 // Physics buffer dims (square-ish texture holding P particles), set in buffer_setup.
 int PB_width = 0;
@@ -98,6 +101,7 @@ Shader densityShader = {.name = "densityShader"};
 Shader positionShader = {.name = "positionShader"};
 Shader velocityShader = {.name = "velocityShader"};
 Shader copyShader = {.name = "copyShader"};
+Shader structureShader = {.name = "structureShader"};
 Shader trailShader = {.name = "trailShader"};
 Shader upscaleShader = {.name = "upscaleShader"};
 Shader debugShader = {.name = "debugShader"};
@@ -108,11 +112,13 @@ Shader debugShader = {.name = "debugShader"};
 #include "density.h"
 #include "position.h"
 #include "screen.h"
+#include "structure.h"
 #include "trail.h"
 #include "upscale.h"
 #include "velocity.h"
 
 Buffer trailBuffer = {.name = "Trail Buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
+Buffer structureBuffer = {.name = "Structure Tensor Buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer positionBuffer = {.name = "Position buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer velocityBuffer = {.name = "Velocity buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 Buffer densityBuffer = {.name = "Density buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
@@ -122,14 +128,20 @@ Buffer screenBuffer = {.name = "Screen buffer", .textures = NULL, .framebuffers 
 Buffer renderBuffer = {.name = "Render buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
 
 // Alpha blending of each of the fragments
-double densityAlpha = 0; // --density-alpha: per-particle density deposit
-double kernelRadius = 0; // --density-kernel: density splat radius (sim px)
+double densityAlpha = 0; // --dens-alpha: per-particle density deposit
+double kernelRadius = 0; // --dens-kernel: density splat radius (sim px)
 // Force-field tuning (velocity.frag uniforms). All in sim px / sim units, render_scale-independent.
-double densityForce = 0; // --density-force: density-gradient repel strength
+double densityForce = 0; // --dens-force: density-gradient repel strength
 double trailForce = 0;   // --trail-force: trail-gradient attract strength
 double edgeRepel = 0;    // --edge-repel: edge repulsion strength
-double densityReach = 0; // --density-reach: density sampling radius (sim px)
+double densityReach = 0; // --dens-reach: density sampling radius (sim px)
 double trailReach = 0;   // --trail-reach: trail sampling radius (sim px)
+// Structure-tensor line-break. The gradient structure tensor of the instantaneous density field
+// detects local density lines/ridges; particles get pushed perpendicular (per-particle sign) to
+// dissolve them, gated by local density so voids are untouched. See structure.frag + velocity.frag.
+double lineForce = 0;    // --line-force: line-break push strength (0 = off)
+double lineWindow = 0;   // --line-window: structure-tensor box half-width (sim px)
+double lineCoherence = 0; // --line-coherence: min tensor coherence to push (0..1; below = no orientation)
 
 // The density/trail buffers are heavily downsampled, lerped physics fields -- not
 // the rendered image. Scattering every Nth particle into them (with the per-point
@@ -149,7 +161,7 @@ double headroomMargin = 0;      // --headroom-margin: tracked-max multiplier
 double headroomAttack = 0;      // --headroom-attack: EMA alpha when density RISES
 double headroomRelease = 0;     // --headroom-release: EMA alpha when density FALLS
 double renderGamma = 0;         // --gamma: colormap curve (1 = linear/punchy, <1 lifts faint)
-bool densityNearest = false;    // --density-nearest: GL_NEAREST density (chunky pixels) vs default GL_LINEAR
+bool densityNearest = false;    // --dens-nearest: GL_NEAREST density (chunky pixels) vs default GL_LINEAR
 double headroomPct = 0;         // --headroom-pct: track this density percentile, not the max
 float headroom_ema = 0.0f;      // running EMA of the density max (the auto headroom)
 float *density_readback = NULL; // CPU scratch for reading the density buffer back
@@ -161,13 +173,20 @@ int density_height = 0;
 
 double dragCoefficient = 0;   // --drag: quadratic velocity damping coefficient
 double ditherCoefficient = 0; // --dither: density-scaled random kick magnitude
-double ditherDensityGain = 0; // --dither-density-gain: gain on the density-scaled dither
+double ditherDensityGain = 0; // --dither-gain: gain on the density-scaled dither
 double ditherOrtho = 0;       // --dither-ortho: density^2-scaled jitter perpendicular to velocity
 bool legacyWedge = false;     // --legacy-wedge: old acos trail-integral heading (drops sign of vy)
 
 // Alpha blending of each of the fragments
 double trailIntensity = 0; // --trail-intensity: per-particle trail deposit
-const float trailAlpha = 0.85f;
+double trailTau = 0;       // --trail-tau: trail decay time constant in FRAMES (decays every frame)
+
+// Exp-decay factor per update from a time constant in frames: after `tau` frames the field
+// has decayed by 1/e. `every` = frames between decay steps (1 for the per-frame trail), so the
+// frame-units tau is invariant to it.
+static inline float decay_alpha(double tau_frames, int every) {
+    return (float)exp(-(double)every / tau_frames);
+}
 double trailRadius = 0;          // --trail-kernel: trail splat radius (sim px)
 int trailBufferDownsampling = 0; // trail field resolution = render-res / this. --trail-downsample.
 double trailVelocityFloor = 0;   // --trail-floor: min velocity for a particle to deposit trail
@@ -439,6 +458,15 @@ static dropt_error parse_density(dropt_context *ctx, const dropt_option *opt, co
     return dropt_error_none;
 }
 
+// --dump-params[=FORMAT]: optional value. Bare flag defaults to "ini". Just records the format
+// string; the actual dump + exit happens at the end of parse_args (once all params are resolved).
+static dropt_error parse_dump_params(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest) {
+    (void)ctx;
+    (void)opt;
+    *(const char **)dest = (arg == NULL || arg[0] == '\0') ? "ini" : arg;
+    return dropt_error_none;
+}
+
 // Config-from-stdin support. `goo -` reads an .ini config from stdin and parses
 // it through the SAME dropt options as the cli, so every flag works in either
 // place with one validation path. Each `key = value` becomes a `--key=value`
@@ -531,12 +559,34 @@ static const char *token_flag_name(const char *tok, char *out, size_t cap) {
 static bool is_window_only(const char *name) {
     static const char *w[] = {
         "monitor", "windowed", "no-border", "width", "height", "fps",
-        "mouse-debug", "corners-debug", "no-keyfocus-steal", "profile", "warmup",
+        "mouse-debug", "corners-debug", "no-keyfocus-steal", "profile",
         "dump", "headless"};
     for (size_t i = 0; i < sizeof w / sizeof w[0]; i++)
         if (strcmp(name, w[i]) == 0)
             return true;
     return false;
+}
+
+// Dump every resolved value param as `key = value`, matching the default-params.ini format, by
+// walking the (merged) option table and formatting each entry by its handler. Doubles/ints/bools
+// only -- string params (--dump, --headless) and the meta flags (help, dump-params) are skipped,
+// as is `particles` (P isn't derived until sim_setup; the resolved oracle is `density`).
+static void dump_params_ini(FILE *out, const dropt_option *opts, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        const dropt_option *o = &opts[i];
+        if (o->long_name == NULL || o->dest == NULL)
+            continue; // section headers / valueless entries
+        if (strcmp(o->long_name, "help") == 0 || strcmp(o->long_name, "dump-params") == 0)
+            continue;
+        dropt_option_handler_func h = o->handler;
+        if (h == dropt_handle_double || h == parse_density || h == parse_render_scale || h == parse_cull)
+            fprintf(out, "%s = %g\n", o->long_name, *(const double *)o->dest);
+        else if (h == parse_int || h == parse_seed)
+            fprintf(out, "%s = %d\n", o->long_name, *(const int *)o->dest);
+        else if (h == dropt_handle_bool)
+            fprintf(out, "%s = %d\n", o->long_name, (int)*(const dropt_bool *)o->dest);
+        // parse_count (particles), string handlers, etc. -> skipped
+    }
 }
 
 // Parse command-line options into the runtime globals above. Exits the process
@@ -558,46 +608,46 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         {'h', "help", "Show this help and exit.", NULL,
          dropt_handle_bool, &show_help, dropt_attr_halt},
 
-        {'\0', NULL, "\nDISPLAY", NULL, NULL, NULL},
-        {'\0', "no-vsync", "Disable vsync (uncap the frame rate).", NULL,
-         dropt_handle_bool, &no_vsync},
-
         {'\0', NULL, "\nPARTICLES", NULL, NULL, NULL},
         {'p', "particles", "Number of particles to simulate (plain or scientific notation, e.g. 200000, 1e6).", "N",
          parse_count, &P},
         {'d', "density", "Particles per logical-pixel^2 (sim-area + render-scale independent; default 0.05; excludes -p).", "F",
          parse_density, &init_density},
-        {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier; bare -r = 2).", "N",
-         parse_render_scale, &render_scale, dropt_attr_optional_val},
-        {'\0', "seed", "Fixed RNG seed (bare --seed = random but printed for replay; 0 = silent random).", "N",
-         parse_seed, &rng_seed, dropt_attr_optional_val},
+        {'\0', "default-density-r", "density*render_scale invariant: default density = this/render_scale when --density unset.", "F",
+         dropt_handle_double, &default_density_r},
         {'\0', "init-warp", "Magnitude of the perlin warp on initial positions (0 = pure uniform; default 0.1).", "F",
          dropt_handle_double, &init_warp},
         {'\0', "drag", "Quadratic velocity damping coefficient (higher = more damping; default 0.11).", "F",
          dropt_handle_double, &dragCoefficient},
         {'\0', "dither", "Density-scaled random kick magnitude (default 0.1).", "F",
          dropt_handle_double, &ditherCoefficient},
-        {'\0', "dither-density-gain", "Gain on the density-scaled dither (>1 = more jitter in dense regions; default 6.5).", "F",
+        {'\0', "dither-gain", "Gain on the density-scaled dither (>1 = more jitter in dense regions; default 6.5).", "F",
          dropt_handle_double, &ditherDensityGain},
         {'\0', "dither-ortho", "Density^2-scaled jitter perpendicular to velocity (default 0).", "F",
          dropt_handle_double, &ditherOrtho},
-        {'\0', "density-force", "Density-gradient repel strength (default 0.04).", "F",
+        {'\0', "dens-force", "Density-gradient repel strength (default 0.04).", "F",
          dropt_handle_double, &densityForce},
         {'\0', "trail-force", "Trail-gradient attract strength (default 0.07).", "F",
          dropt_handle_double, &trailForce},
         {'\0', "edge-repel", "Edge repulsion strength (default 0.18).", "F",
          dropt_handle_double, &edgeRepel},
-        {'\0', "density-reach", "Density force sampling radius in sim px (default 20).", "F",
+        {'\0', "dens-reach", "Density force sampling radius in sim px (default 20).", "F",
          dropt_handle_double, &densityReach},
         {'\0', "trail-reach", "Trail force sampling radius in sim px (default 30).", "F",
          dropt_handle_double, &trailReach},
-        {'\0', "cull", "Screen density cull, 0..1 (bare --cull = 0.8; thins denser regions).", "F",
-         parse_cull, &cullAmount, dropt_attr_optional_val},
+        {'\0', "line-force", "Structure-tensor line-break push strength (spread density lines apart; 0 = off).", "F",
+         dropt_handle_double, &lineForce},
+        {'\0', "line-window", "Structure-tensor box half-width in sim px (line-detection scale; default 20).", "F",
+         dropt_handle_double, &lineWindow},
+        {'\0', "line-coherence", "Min structure-tensor coherence 0..1 to push (below = no orientation; default 0.5).", "F",
+         dropt_handle_double, &lineCoherence},
 
         {'\0', NULL, "\nCOLORMAP", NULL, NULL, NULL},
         {'\0', "gamma", "Colormap curve: 1 = linear/punchy, <1 lifts faint regions.", "F",
          dropt_handle_double, &renderGamma},
-        {'\0', "density-nearest", "Sample the density field with GL_NEAREST (chunky pixels) instead of GL_LINEAR.", NULL,
+        {'\0', "cull", "Screen density cull, 0..1 (bare --cull = 0.8; thins denser regions).", "F",
+         parse_cull, &cullAmount, dropt_attr_optional_val},
+        {'\0', "dens-nearest", "Sample the density field with GL_NEAREST (chunky pixels) instead of GL_LINEAR.", NULL,
          dropt_handle_bool, &dens_near},
         {'\0', "headroom", "Fixed colormap headroom (0 = auto-track the density max).", "F",
          dropt_handle_double, &renderHeadroom},
@@ -611,12 +661,14 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_double, &headroomPct},
 
         {'\0', NULL, "\nDENSITY / TRAIL", NULL, NULL, NULL},
-        {'\0', "density-alpha", "Per-particle density deposit (default 0.005).", "F",
+        {'\0', "dens-alpha", "Per-particle density deposit (default 0.005).", "F",
          dropt_handle_double, &densityAlpha},
-        {'\0', "density-kernel", "Density splat radius in sim px (default 30).", "F",
+        {'\0', "dens-kernel", "Density splat radius in sim px (default 30).", "F",
          dropt_handle_double, &kernelRadius},
         {'\0', "trail-intensity", "Per-particle trail deposit (default 0.06).", "F",
          dropt_handle_double, &trailIntensity},
+        {'\0', "trail-tau", "Trail decay time constant in frames (larger = longer-lasting trails; default 6.15).", "F",
+         dropt_handle_double, &trailTau},
         {'\0', "trail-kernel", "Trail splat radius in sim px (default 15).", "F",
          dropt_handle_double, &trailRadius},
         {'\0', "trail-floor", "Min particle velocity to deposit trail (default 0.6).", "F",
@@ -633,10 +685,20 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          parse_int, &trailBufferDownsampling},
         {'\0', "trail-every", "Update the trail field every N frames (decay/deposit compensated).", "N",
          parse_int, &trail_every},
-        {'\0', "sort-every", "Rebuild tile-coherent draw order every N frames (0 = never).", "N",
-         parse_int, &sort_every},
 
         {'\0', NULL, "\nMISC", NULL, NULL, NULL},
+        {'r', "render-scale", "Internal render resolution divisor (>1 = lower res, faster, chunkier; bare -r = 2).", "N",
+         parse_render_scale, &render_scale, dropt_attr_optional_val},
+        {'\0', "seed", "Fixed RNG seed (bare --seed = random but printed for replay; 0 = silent random).", "N",
+         parse_seed, &rng_seed, dropt_attr_optional_val},
+        {'\0', "sort-every", "Rebuild tile-coherent draw order every N frames (0 = never).", "N",
+         parse_int, &sort_every},
+        {'\0', "warmup", "Simulate N frames before presenting -- skips the boring startup ramp (both windowed + headless).", "N",
+         parse_int, &warmup},
+        {'\0', "dump-params", "Print the resolved params (bare = 'ini' format) and exit.", "FORMAT",
+         parse_dump_params, &dump_params_fmt, dropt_attr_optional_val},
+        {'\0', "no-vsync", "Disable vsync (uncap the frame rate).", NULL,
+         dropt_handle_bool, &no_vsync},
         {'\0', "no-mouse", "Disable the mouse repel interaction.", NULL,
          dropt_handle_bool, &nomouse},
         {'\0', "legacy-wedge", "Use the old acos trail-integral heading (drops sign of vy; pre-fix look).", NULL,
@@ -662,15 +724,13 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         {'\0', "fps", "Throttle the average frame rate to N fps (0 = uncapped).", "N",
          parse_int, &fps_cap},
 
-        {'\0', NULL, "\nDEBUG / BENCHMARK", NULL, NULL, NULL},
+        {'\0', NULL, "\nDEBUG", NULL, NULL, NULL},
         {'\0', "mouse-debug", "Draw a green dot and trail at the cursor position.", NULL,
          dropt_handle_bool, &mouse_debug},
         {'\0', "corners-debug", "Draw green squares in the window corners (debug viewport mapping).", NULL,
          dropt_handle_bool, &corners_debug},
         {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
          dropt_handle_bool, &prof},
-        {'\0', "warmup", "Simulate N frames before presenting -- skips the boring startup ramp (both windowed + headless).", "N",
-         parse_int, &warmup},
         // NOTE: macos-only -- samespace cover (Spaces, focus-steal) is meaningless on x11/wayland
 #ifdef RGFW_MACOS
         {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
@@ -809,6 +869,28 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         exit(EXIT_FAILURE);
     }
 
+    // The ini bakes `density = nan` as an "unset by user" sentinel (an explicit -d/--density
+    // parses to a finite value and overrides it). When left unset, derive the default from the
+    // config's density*render_scale invariant (--default-density-r): density = invariant/render_scale,
+    // so it halves per doubling of -r (the ini can't express an r-dependent value directly).
+    if (isnan(init_density) && render_scale > 0.0)
+        init_density = default_density_r / render_scale;
+
+    // --dump-params[=FORMAT]: every param is resolved now (and we're still before any window/GL
+    // setup, since parse_args runs first). Print + exit. Only 'ini' format so far.
+    if (dump_params_fmt != NULL) {
+        if (strcmp(dump_params_fmt, "ini") != 0) {
+            fprintf(stderr, "goo: unknown --dump-params format '%s' (supported: ini)\n", dump_params_fmt);
+            dropt_free_context(ctx);
+            free(options);
+            exit(EXIT_FAILURE);
+        }
+        dump_params_ini(stdout, options, n_core + n_extra);
+        dropt_free_context(ctx);
+        free(options);
+        exit(EXIT_SUCCESS);
+    }
+
     dropt_free_context(ctx);
     free(options);
 
@@ -847,6 +929,12 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
     }
     if (densityBufferDownsampling < 1 || trailBufferDownsampling < 1) {
         fprintf(stderr, "goo: --dens-downsample/--trail-downsample must be >= 1\n");
+        exit(EXIT_FAILURE);
+    }
+    // Decay time constant feeds exp(-1/tau): tau <= 0 gives alpha 0 (trail wiped every frame),
+    // which silently kills the trail dynamics. Reject it.
+    if (trailTau <= 0.0) {
+        fprintf(stderr, "goo: --trail-tau must be > 0\n");
         exit(EXIT_FAILURE);
     }
     if (densitySubsample < 1 || trailSubsample < 1) {
@@ -895,6 +983,11 @@ void shader_setup(void) {
     shader_compile(&copyShader, GL_VERTEX_SHADER, copy_VertexShaderSource);
     shader_compile(&copyShader, GL_FRAGMENT_SHADER, copy_FragmentShaderSource);
     shader_link(&copyShader);
+
+    shader_create(&structureShader);
+    shader_compile(&structureShader, GL_VERTEX_SHADER, structure_VertexShaderSource);
+    shader_compile(&structureShader, GL_FRAGMENT_SHADER, structure_FragmentShaderSource);
+    shader_link(&structureShader);
 
     shader_create(&trailShader);
     shader_compile(&trailShader, GL_VERTEX_SHADER, trail_VertexShaderSource);
@@ -1021,11 +1114,11 @@ void buffer_setup(void) {
     }
 
     // Initalise textures and the associated framebuffers
-    glGenTextures(8, textures);
-    glGenFramebuffers(8, framebuffers);
+    glGenTextures(9, textures);
+    glGenFramebuffers(9, framebuffers);
 
     // Texture 0 - Density buffer
-    densityBuffer.minmag_filter = densityNearest ? GL_NEAREST : GL_LINEAR; // --density-nearest for chunky pixels
+    densityBuffer.minmag_filter = densityNearest ? GL_NEAREST : GL_LINEAR; // --dens-nearest for chunky pixels
     densityBuffer.wrap_st = GL_REPEAT;
     densityBuffer.dim = BE_1D;
     buffer_allocate(&densityBuffer, current, densityBufferIndex, density_width, density_height, NULL);
@@ -1101,6 +1194,14 @@ void buffer_setup(void) {
     buffer_allocate(&trailBuffer, current, trailBufferIndex1, trail_width, trail_height,
                     restoring ? (const char *)g_restore->trail : NULL);
     buffer_allocate(&trailBuffer, other, trailBufferIndex2, trail_width, trail_height, NULL);
+
+    // Texture 8 - Structure tensor of the density field (RGB = Jxx,Jxy,Jyy). Single buffer (never
+    // flipped -- regenerated each update from the density field). Density-field resolution, GL_LINEAR
+    // so the per-particle sample interpolates smoothly.
+    structureBuffer.minmag_filter = GL_LINEAR;
+    structureBuffer.wrap_st = GL_REPEAT;
+    structureBuffer.dim = BE_3D;
+    buffer_allocate(&structureBuffer, current, structureBufferIndex, density_width, density_height, NULL);
 
     // Texture 7 - internal render target (rgba colour) at render resolution.
     // GL_NEAREST so the upscale to the window stays crisp/pixelated at low res.
@@ -1243,6 +1344,7 @@ void sim_resize(int logical_w, int logical_h, int fb_w, int fb_h) {
     trail_height = height / trailBufferDownsampling + 1;
     buffer_reallocate(&trailBuffer, current, trail_width, trail_height);
     buffer_reallocate(&trailBuffer, other, trail_width, trail_height);
+    buffer_reallocate(&structureBuffer, current, density_width, density_height);
     // sort_counts is sized by tile count, which grows with width/height -- resize it too,
     // else rebuild_sort_order writes past the end (sort_idx/sort_key are P-sized, stable).
     {
@@ -1280,12 +1382,22 @@ static void sim_apply_static_uniforms(void) {
     shader_set_uniform_float(&velocityShader, "density_reach", (float)densityReach);
     shader_set_uniform_float(&velocityShader, "trail_reach", (float)trailReach);
     shader_set_uniform_int(&velocityShader, "density_buffer", densityBuffer.current);
+    // Structure-tensor line-break. structure_buffer is single (never flips), so its index is
+    // static. The box half-width is a sim-px knob; convert sim px -> render px (SIM_SCALE/render_scale)
+    // -> density-buffer texels (/downsampling), floored at 1 texel.
+    shader_set_uniform_float(&velocityShader, "line_force", (float)lineForce);
+    shader_set_uniform_float(&velocityShader, "line_coherence", (float)lineCoherence);
+    shader_set_uniform_int(&velocityShader, "structure_buffer", structureBuffer.current);
+    int line_window_texels = (int)lround(lineWindow * (SIM_SCALE / render_scale) / densityBufferDownsampling);
+    if (line_window_texels < 1)
+        line_window_texels = 1;
+    shader_set_uniform_int(&structureShader, "window_radius", line_window_texels);
     // Trail spread-deposit (--trail-every N): the trail decays EVERY frame (smooth fade,
     // no frozen-field discontinuity), but each frame deposits only a rotating 1/N subset
     // of the trail particles. With the per-point intensity scaled by N, the per-frame
     // deposit total -- and so the field the physics sees -- is unchanged, while the
     // expensive point scatter drops ~N x. Decay alpha stays per-frame (no compounding).
-    shader_set_uniform_float(&copyShader, "alpha", trailAlpha);
+    shader_set_uniform_float(&copyShader, "alpha", decay_alpha(trailTau, 1));
     shader_set_uniform_int(&trailShader, "trail_buffer_downsampling", trailBufferDownsampling);
     shader_set_uniform_float(&trailShader, "trail_intensity", trailIntensity * trailSubsample * trail_every);
     shader_set_uniform_float(&trailShader, "velocity_floor", trailVelocityFloor);
@@ -1398,6 +1510,17 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
     }
     LAP(2);
 
+    // Structure-tensor pass: gradient structure tensor of the freshly-rebuilt density field.
+    // The box-average in the shader denoises; the current lines to break live here. Single
+    // non-separable draw into the (single) structure buffer; the velocity shader eigen-solves
+    // it per particle. Same cadence as the density rebuild.
+    if (lineForce != 0.0 && (dens_every <= 1 || epoch_counter % dens_every == 0)) {
+        shader_use(&structureShader);
+        shader_set_uniform_int(&structureShader, "density_src", densityBuffer.current);
+        buffer_bind(&structureBuffer, current);
+        buffer_update(&structureBuffer);
+    }
+
     // Trail buffer. Decay every frame (smooth), but deposit only a rotating 1/N
     // subset of the trail particles (--trail-every N), cycling the contiguous block
     // by frame. Particle ids aren't spatially sorted, so each block is a fair random
@@ -1405,7 +1528,7 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
     buffer_bind(&trailBuffer, other);
 
     shader_use(&copyShader); // First pass (decay the previous trail, every frame)
-    shader_set_uniform_float(&copyShader, "alpha", trailAlpha);
+    shader_set_uniform_float(&copyShader, "alpha", decay_alpha(trailTau, 1));
     shader_set_uniform_int(&copyShader, "source_buffer", trailBuffer.current);
     buffer_update(&trailBuffer);
 
