@@ -582,6 +582,9 @@ static void dump_params_ini(FILE *out, const dropt_option *opts, size_t n) {
 // on --help or on a bad option; returns normally to let the sim start.
 void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
     dropt_bool show_help = 0;
+#ifdef GOO_VERSION
+    dropt_bool show_version = 0; // --version: only compiled in when GOO_VERSION is baked (CI tag builds)
+#endif
     dropt_bool windowed = 0;
     dropt_bool no_vsync = 0;
     dropt_bool prof = 0;
@@ -596,6 +599,10 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
     dropt_option core_opts[] = {
         {'h', "help", "Show this help and exit.", NULL,
          dropt_handle_bool, &show_help, dropt_attr_halt},
+#ifdef GOO_VERSION
+        {'\0', "version", "Print the version and exit.", NULL,
+         dropt_handle_bool, &show_version, dropt_attr_halt},
+#endif
 
         {'\0', NULL, "\nPARTICLES", NULL, NULL, NULL},
         {'p', "particles", "Number of particles to simulate (plain or scientific notation, e.g. 200000, 1e6).", "N",
@@ -849,6 +856,15 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         dropt_free_context(ctx);
         exit(EXIT_FAILURE);
     }
+
+#ifdef GOO_VERSION
+    if (show_version) {
+        fprintf(stdout, "%s\n", GOO_VERSION);
+        dropt_free_context(ctx);
+        free(options);
+        exit(EXIT_SUCCESS);
+    }
+#endif
 
     // --dump-params[=FORMAT]: every param is resolved now (and we're still before any window/GL
     // setup, since parse_args runs first). Print + exit. Only 'ini' format so far.

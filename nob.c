@@ -87,6 +87,16 @@ static void add_platform_libs(Cmd *cmd) {
 #endif
 }
 
+// If GOO_VERSION is set in the environment (CI sets it to the tag on a release build), bake it in
+// as a string macro so the binary reports it via --version. Unset (normal local build) -> the macro
+// (and thus the flag) isn't compiled in. NOTE: not a needs_rebuild input, so a version-only change
+// on an otherwise-cached tree won't rebuild -- fine for CI (fresh checkout), irrelevant locally.
+static void add_version_define(Cmd *cmd) {
+    const char *v = getenv("GOO_VERSION");
+    if (v && v[0])
+        cmd_append(cmd, temp_sprintf("-DGOO_VERSION=\"%s\"", v));
+}
+
 // append src (count bytes) as an escaped C string literal, surrounding quotes included.
 // GLSL is ascii so json.dumps' \uXXXX is overkill (and invalid C for <0x20); fixed
 // 3-digit octal escapes are valid C and never run greedily into the next char.
@@ -318,6 +328,7 @@ static bool build_goo_wlwp(void) {
     nob_cc(&cmd);
     cmd_append(&cmd, "-O3");
     cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR, "-I" WLWP_GEN_DIR);
+    add_version_define(&cmd);
     cmd_append(&cmd, "-o", wlwp_bin_path);
     for (size_t i = 0; i < NOB_ARRAY_LEN(wlwp_sources); i++)
         cmd_append(&cmd, wlwp_sources[i]);
@@ -364,6 +375,7 @@ static bool build_goo_macwp(void) {
     cmd_append(&cmd, "-O3");
     cmd_append(&cmd, "-DGL_SILENCE_DEPRECATION"); // OpenGL is deprecated on macos but works; mute the noise
     cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR);
+    add_version_define(&cmd);
     cmd_append(&cmd, "-o", macwp_bin_path);
     for (size_t i = 0; i < NOB_ARRAY_LEN(macwp_sources); i++)
         cmd_append(&cmd, macwp_sources[i]);
@@ -405,6 +417,7 @@ static bool build_goo(void) {
     nob_cc(&cmd);
     cmd_append(&cmd, "-O3");
     cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR);
+    add_version_define(&cmd);
     cmd_append(&cmd, "-o", bin_path);
     for (size_t i = 0; i < NOB_ARRAY_LEN(sources); i++)
         cmd_append(&cmd, sources[i]);
@@ -448,6 +461,7 @@ static bool build_goo_x11wp(void) {
     nob_cc(&cmd);
     cmd_append(&cmd, "-O3");
     cmd_append(&cmd, "-Ilib", "-I" SHADER_DIR, "-I.");
+    add_version_define(&cmd);
     cmd_append(&cmd, "-o", x11wp_bin_path);
     for (size_t i = 0; i < NOB_ARRAY_LEN(x11wp_sources); i++)
         cmd_append(&cmd, x11wp_sources[i]);
