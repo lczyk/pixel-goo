@@ -74,9 +74,13 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/**
-          fail_on_unmatched_files: true
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, '-') }}
+      # official github cli (preinstalled) -- no maintained actions/* release action exists.
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=
+          case "${{ github.ref_name }}" in *-*) prerelease=--prerelease ;; esac
+          gh release create "${{ github.ref_name }}" dist/* \
+            --generate-notes $prerelease
