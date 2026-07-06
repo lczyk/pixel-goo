@@ -38,6 +38,8 @@ extern bool no_border;
 extern bool no_mouse;
 extern bool mouse_debug;
 extern bool corners_debug;
+extern bool exclusions_debug;
+extern bool edge_debug;
 extern char *dump_path;
 extern char *headless_path;
 extern FILE *ffmpeg_pipe;
@@ -49,8 +51,8 @@ extern bool p_given;
 extern int whichMonitor;
 
 // ---- gl objects / buffers ----
-extern GLuint textures[8];
-extern GLuint framebuffers[8];
+extern GLuint textures[9];
+extern GLuint framebuffers[9];
 extern const PBindex densityBufferIndex;
 extern const PBindex positionBufferIndex1;
 extern const PBindex positionBufferIndex2;
@@ -59,18 +61,19 @@ extern const PBindex velocityBufferIndex2;
 extern const PBindex trailBufferIndex1;
 extern const PBindex trailBufferIndex2;
 extern const PBindex renderBufferIndex;
+extern const PBindex repelBufferIndex;
 extern int PB_width, PB_height;
 extern GLuint pbo_pos, pbo_vel;
 
 extern Shader screenShader, densityShader, positionShader, velocityShader;
-extern Shader copyShader, trailShader, upscaleShader, debugShader;
+extern Shader copyShader, trailShader, upscaleShader, debugShader, repelShader;
 
 extern Buffer trailBuffer, positionBuffer, velocityBuffer, densityBuffer;
-extern Buffer screenBuffer, renderBuffer;
+extern Buffer screenBuffer, renderBuffer, repelBuffer;
 
 // ---- tunables (default-params is the source of truth; see nob.c) ----
 extern double densityAlpha, kernelRadius;
-extern double densityForce, trailForce, edgeRepel, densityReach, trailReach;
+extern double densityForce, trailForce, repel, reach, trailReach, antiStick;
 extern int densitySubsample, trailSubsample, dens_every, trail_every;
 extern double cullAmount;
 extern double renderHeadroom, headroomMargin, headroomAttack, headroomRelease, renderGamma;
@@ -79,6 +82,7 @@ extern double headroomPct;
 extern float headroom_ema;
 extern float *density_readback;
 extern int densityBufferDownsampling, density_width, density_height;
+extern int repelBufferDownsampling, repel_width, repel_height;
 extern double dragCoefficient, ditherCoefficient, ditherDensityGain, ditherOrtho;
 extern bool legacyWedge;
 extern double trailIntensity;
@@ -87,6 +91,14 @@ extern int trailBufferDownsampling;
 extern double trailVelocityFloor;
 extern int trail_width, trail_height;
 extern int P;
+
+// ---- exclusion primitives (bounding rect minus N shapes) ----
+// --exclusions "rect(x,y,w,h);rect(x,y,w,h);...": primitive calls in logical px, relative to
+// the sim's own logical origin. Only "rect" is implemented today. Window-only (not exposed on
+// wlwp/macwp/x11wp). Default count 0 = today's full-rect behaviour, unchanged.
+#define MAX_EXCLUSION_RECTS 16
+extern float exclusionRects[MAX_EXCLUSION_RECTS][4]; // x,y,w,h per rect, logical px
+extern int exclusionRectCount;
 
 // --gl-refresh <dur>: how often (seconds) to recreate the GL context to reclaim
 // the freedreno per-submit leak (see debug/). default 30m; 0 = never. wallpaper only.

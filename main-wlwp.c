@@ -380,8 +380,8 @@ int main(int argc, char **argv) {
 
     // Clean teardown -> compositor repaints whatever wallpaper was underneath.
     glBindVertexArray(0);
-    glDeleteTextures(8, textures);
-    glDeleteFramebuffers(8, framebuffers);
+    glDeleteTextures(9, textures);
+    glDeleteFramebuffers(9, framebuffers);
     egl_teardown();
     eglTerminate(egl_display);
     zwlr_layer_surface_v1_destroy(layer_surface);

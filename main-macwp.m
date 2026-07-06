@@ -262,8 +262,8 @@ int main(int argc, char **argv) {
 
         // Clean teardown -> the desktop picture underneath repaints.
         glBindVertexArray(0);
-        glDeleteTextures(8, textures);
-        glDeleteFramebuffers(8, framebuffers);
+        glDeleteTextures(9, textures);
+        glDeleteFramebuffers(9, framebuffers);
         [NSOpenGLContext clearCurrentContext];
         for (NSUInteger i = 0; i < nwin; i++)
             [windows[i] close];

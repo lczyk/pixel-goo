@@ -63,6 +63,8 @@ bool no_border = false;            // --no-border: hide the title bar / border i
 bool no_mouse = false;             // --no-mouse: disable the mouse repel (park the cursor far off)
 bool mouse_debug = false;          // --mouse-debug: draw green dot + trail at cursor
 bool corners_debug = false;        // --corners-debug: draw green squares in the window corners
+bool exclusions_debug = false;     // --exclusions-debug: tint excluded regions green
+bool edge_debug = false;           // --edge-debug: tint the bounding-edge repel bands green
 char *dump_path = NULL;            // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
 const char *dump_params_fmt = NULL; // --dump-params[=FORMAT]: print resolved params and exit (NULL = don't)
 char *headless_path = NULL;        // --headless <out>: pipe raw render-res frames to ffmpeg, no window present
@@ -75,8 +77,8 @@ bool p_given = false;              // whether -p/--particles was passed -- if so
 int whichMonitor = 0;
 
 // Textures and framebuffers
-GLuint textures[8];
-GLuint framebuffers[8];
+GLuint textures[9];
+GLuint framebuffers[9];
 const PBindex densityBufferIndex = 0;
 const PBindex positionBufferIndex1 = 1;
 const PBindex positionBufferIndex2 = 2;
@@ -85,6 +87,7 @@ const PBindex velocityBufferIndex2 = 4;
 const PBindex trailBufferIndex1 = 5;
 const PBindex trailBufferIndex2 = 6;
 const PBindex renderBufferIndex = 7; // internal colour target, upscaled to the window
+const PBindex repelBufferIndex = 8; // force-potential (r) + dispersion (g); single-buffered, stateless
 
 // Physics buffer dims (square-ish texture holding P particles), set in buffer_setup.
 int PB_width = 0;
@@ -101,12 +104,14 @@ Shader velocityShader = {.name = "velocityShader"};
 Shader copyShader = {.name = "copyShader"};
 Shader trailShader = {.name = "trailShader"};
 Shader upscaleShader = {.name = "upscaleShader"};
-Shader debugShader = {.name = "debugShader"};
+Shader debugShader = {.name = "debugShader"}; // unified debug overlay: exclusions/edge/mouse (fullscreen fill + markers)
+Shader repelShader = {.name = "repelShader"};
 
 // Include shader source files
 #include "copy.h"
 #include "debug.h"
 #include "density.h"
+#include "repel.h"
 #include "position.h"
 #include "screen.h"
 #include "trail.h"
@@ -121,6 +126,9 @@ Buffer screenBuffer = {.name = "Screen buffer", .textures = NULL, .framebuffers 
 // Internal render target: the visual passes draw here at render resolution, then
 // upscaleShader nearest-samples it onto screenBuffer (the actual window).
 Buffer renderBuffer = {.name = "Render buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 1};
+// Force-potential (r) + dispersion (g) field: single-buffered and stateless -- fully cleared
+// and re-splatted (edges + exclusion rects + mouse) from scratch every sim_step, no ping-pong.
+Buffer repelBuffer = {.name = "Repel buffer", .textures = textures, .framebuffers = framebuffers, .current = 0, .other = 0};
 
 // Alpha blending of each of the fragments
 double densityAlpha = 0; // --dens-alpha: per-particle density deposit
@@ -128,9 +136,10 @@ double kernelRadius = 0; // --dens-kernel: density splat radius (sim px)
 // Force-field tuning (velocity.frag uniforms). All in sim px / sim units, render_scale-independent.
 double densityForce = 0; // --dens-force: density-gradient repel strength
 double trailForce = 0;   // --trail-force: trail-gradient attract strength
-double edgeRepel = 0;    // --edge-repel: edge repulsion strength
-double densityReach = 0; // --dens-reach: density sampling radius (sim px)
+double repel = 0;        // --repel: overall interaction repel strength (walls + exclusions + mouse)
+double reach = 0;        // --reach: density/interaction VDI sampling radius (sim px)
 double trailReach = 0;   // --trail-reach: trail sampling radius (sim px)
+double antiStick = 0;    // --anti-stick: tiny cardinal drift unsticking motionless particles in repel zones
 
 // The density/trail buffers are heavily downsampled, lerped physics fields -- not
 // the rendered image. Scattering every Nth particle into them (with the per-point
@@ -159,6 +168,9 @@ float *density_readback = NULL; // CPU scratch for reading the density buffer ba
 int densityBufferDownsampling = 0;
 int density_width = 0; // computed in buffer_setup once width/height are final
 int density_height = 0;
+int repelBufferDownsampling = 0; // --repel-downsample: interaction (repel) buffer resolution divisor
+int repel_width = 0;  // computed in buffer_setup, like density_width
+int repel_height = 0;
 
 double dragCoefficient = 0;   // --drag: quadratic velocity damping coefficient
 double ditherCoefficient = 0; // --dither: density-scaled random kick magnitude
@@ -183,6 +195,11 @@ int trail_width = 0;
 int trail_height = 0;
 
 int P = 200000; // --particles
+
+// --exclusions "rect(x,y,w,h);...": exclusion primitives in logical px. Count 0 = no exclusion
+// (today's behaviour). Window-only (see is_window_only); wlwp/macwp/x11wp never set these.
+float exclusionRects[MAX_EXCLUSION_RECTS][4] = {{0}};
+int exclusionRectCount = 0;
 
 // per-pass GPU timing (only populated under --profile)
 double pass_ms[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -447,6 +464,72 @@ static dropt_error parse_density(dropt_context *ctx, const dropt_option *opt, co
     return dropt_error_none;
 }
 
+// --exclusions "rect(x,y,w,h);rect(x,y,w,h);...": exclusion primitives to cut from the sim
+// domain, in logical px. Primitive-call syntax: a bare name token followed by a parenthesised,
+// comma-separated argument list, ';'-separated calls. Hand-rolled split (no strtok -- same
+// manual pointer-walk style as token_flag_name below). Only "rect" (4 numeric args: x,y,w,h)
+// is implemented today; any other primitive name, or a malformed call (missing/extra parens,
+// wrong arg count, non-numeric field, trailing junk), is a hard reject -- same convention as
+// any other flag -- not a silent skip. A primitive count over MAX_EXCLUSION_RECTS is clamped
+// with a warning instead, since truncating the tail is a much less surprising failure mode
+// than refusing to start.
+//
+// Storage stays a plain float[4] per rect (no type tag/union) since only one primitive kind
+// exists, but the dispatch is keyed off the primitive NAME (not off a fixed field count/
+// position), so a second primitive kind later is a new `else if` branch, not a rewrite of the
+// call-splitting logic above it.
+static dropt_error parse_exclusions(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest) {
+    (void)ctx;
+    (void)opt;
+    if (arg == NULL || arg[0] == '\0')
+        return dropt_error_insufficient_arguments;
+
+    int count = 0;
+    const char *call_start = arg;
+    while (*call_start != '\0') {
+        const char *call_end = strchr(call_start, ';');
+        size_t call_len = call_end ? (size_t)(call_end - call_start) : strlen(call_start);
+        if (call_len > 0) { // tolerate a trailing/empty ';' segment
+            const char *paren = memchr(call_start, '(', call_len);
+            if (paren == NULL || call_start[call_len - 1] != ')')
+                return dropt_error_mismatch; // no "name(...)" shape at all
+            size_t name_len = (size_t)(paren - call_start);
+            const char *args_start = paren + 1;
+            size_t args_len = call_len - name_len - 2; // minus "name(" and the trailing ")"
+
+            if (name_len == 4 && strncmp(call_start, "rect", 4) == 0) {
+                if (count >= MAX_EXCLUSION_RECTS) {
+                    fprintf(stderr, "goo: --exclusions: more than %d primitives given, ignoring the rest\n", MAX_EXCLUSION_RECTS);
+                    break;
+                }
+                float v[4];
+                const char *field_start = args_start;
+                for (int n = 0; n < 4; n++) {
+                    char *end;
+                    v[n] = strtof(field_start, &end);
+                    if (end == field_start || (n < 3 && *end != ','))
+                        return dropt_error_mismatch;
+                    field_start = (n < 3) ? end + 1 : end;
+                }
+                if (field_start != args_start + args_len) // trailing junk before the closing ')'
+                    return dropt_error_mismatch;
+                exclusionRects[count][0] = v[0];
+                exclusionRects[count][1] = v[1];
+                exclusionRects[count][2] = v[2];
+                exclusionRects[count][3] = v[3];
+                count++;
+            } else {
+                return dropt_error_mismatch; // unrecognised primitive name
+            }
+        }
+        call_start += call_len;
+        if (*call_start == ';')
+            call_start++;
+    }
+    *(int *)dest = count;
+    return dropt_error_none;
+}
+
 // --dump-params[=FORMAT]: optional value. Bare flag defaults to "ini". Just records the format
 // string; the actual dump + exit happens at the end of parse_args (once all params are resolved).
 static dropt_error parse_dump_params(dropt_context *ctx, const dropt_option *opt, const char *arg, void *dest) {
@@ -549,7 +632,7 @@ static bool is_window_only(const char *name) {
     static const char *w[] = {
         "monitor", "windowed", "no-border", "width", "height", "fps",
         "mouse-debug", "corners-debug", "no-keyfocus-steal", "profile",
-        "dump", "headless"};
+        "dump", "headless", "exclusions", "exclusions-debug", "edge-debug"};
     for (size_t i = 0; i < sizeof w / sizeof w[0]; i++)
         if (strcmp(name, w[i]) == 0)
             return true;
@@ -623,10 +706,12 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_double, &densityForce},
         {'\0', "trail-force", "Trail-gradient attract strength (default 0.07).", "F",
          dropt_handle_double, &trailForce},
-        {'\0', "edge-repel", "Edge repulsion strength (default 0.18).", "F",
-         dropt_handle_double, &edgeRepel},
-        {'\0', "dens-reach", "Density force sampling radius in sim px (default 20).", "F",
-         dropt_handle_double, &densityReach},
+        {'\0', "repel", "Interaction repel strength: walls + exclusions + mouse (default 0.11).", "F",
+         dropt_handle_double, &repel},
+        {'\0', "reach", "Density/interaction force sampling radius in sim px (default 20).", "F",
+         dropt_handle_double, &reach},
+        {'\0', "anti-stick", "Anti-stick drift: tiny per-particle cardinal force freeing motionless particles stuck in repel zones (default 0.009).", "F",
+         dropt_handle_double, &antiStick},
         {'\0', "trail-reach", "Trail force sampling radius in sim px (default 30).", "F",
          dropt_handle_double, &trailReach},
 
@@ -665,6 +750,8 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          parse_int, &densitySubsample},
         {'\0', "dens-downsample", "Density field resolution divisor (render-res / N; higher = coarser/cheaper).", "N",
          parse_int, &densityBufferDownsampling},
+        {'\0', "repel-downsample", "Repel (interaction) buffer resolution divisor (render-res / N; higher = coarser edges/exclusions/mouse).", "N",
+         parse_int, &repelBufferDownsampling},
         {'\0', "dens-every", "Rebuild the density field every N frames (reuse between; cheaper).", "N",
          parse_int, &dens_every},
         {'\0', "trail-sub", "Trail buffer: scatter every Nth particle (higher = less overdraw).", "N",
@@ -717,6 +804,10 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_bool, &mouse_debug},
         {'\0', "corners-debug", "Draw green squares in the window corners (debug viewport mapping).", NULL,
          dropt_handle_bool, &corners_debug},
+        {'\0', "exclusions-debug", "Blend a green tint over excluded regions (debug: visualise exclusion-primitive placement).", NULL,
+         dropt_handle_bool, &exclusions_debug},
+        {'\0', "edge-debug", "Blend a green tint over the bounding-edge repel bands (debug: visualise the edge repel regions).", NULL,
+         dropt_handle_bool, &edge_debug},
         {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
          dropt_handle_bool, &prof},
         // NOTE: macos-only -- samespace cover (Spaces, focus-steal) is meaningless on x11/wayland
@@ -728,6 +819,8 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_string, &dump_path},
         {'\0', "headless", "Render -N frames at render-res, piped to ffmpeg (e.g. out.mp4); no window. Needs ffmpeg.", "OUT",
          dropt_handle_string, &headless_path},
+        {'\0', "exclusions", "Exclusion primitives cut from the sim domain: \"rect(x,y,w,h);rect(x,y,w,h);...\" in logical px (max 16; only 'rect' is implemented).", "PRIMITIVES",
+         parse_exclusions, &exclusionRectCount},
     };
 
     // Wallpaper-only options: only meaningful for the wayland layer-shell front-end.
@@ -917,8 +1010,8 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         fprintf(stderr, "goo: --render-scale must be >= 1\n");
         exit(EXIT_FAILURE);
     }
-    if (densityBufferDownsampling < 1 || trailBufferDownsampling < 1) {
-        fprintf(stderr, "goo: --dens-downsample/--trail-downsample must be >= 1\n");
+    if (densityBufferDownsampling < 1 || trailBufferDownsampling < 1 || repelBufferDownsampling < 1) {
+        fprintf(stderr, "goo: --dens-downsample/--trail-downsample/--repel-downsample must be >= 1\n");
         exit(EXIT_FAILURE);
     }
     // Decay time constant feeds exp(-1/tau): tau <= 0 gives alpha 0 (trail wiped every frame),
@@ -989,7 +1082,46 @@ void shader_setup(void) {
     shader_compile(&debugShader, GL_FRAGMENT_SHADER, debug_FragmentShaderSource);
     shader_link(&debugShader);
 
+    shader_create(&repelShader);
+    shader_compile(&repelShader, GL_VERTEX_SHADER, repel_VertexShaderSource);
+    shader_compile(&repelShader, GL_FRAGMENT_SHADER, repel_FragmentShaderSource);
+    shader_link(&repelShader);
+
+    // debugShader (created above) must be linked before updateShaderWindowShape ->
+    // push_exclusion_rects (below), which pushes the render-space exclusion rects to it.
     updateShaderWindowShape(width, height);
+}
+
+// Push the exclusion-rect list (--exclusions) to every shader that consumes it, each converted
+// into that shader's own coordinate space. Called from updateShaderWindowShape so it's
+// refreshed on resize too -- both conversions below depend on the current window size.
+static void push_exclusion_rects(void) {
+    int count = exclusionRectCount > MAX_EXCLUSION_RECTS ? MAX_EXCLUSION_RECTS : exclusionRectCount;
+    shader_set_uniform_int(&repelShader, "exclusion_rect_count", count);
+    shader_set_uniform_int(&debugShader, "exclusion_rect_count", count);
+    for (int i = 0; i < MAX_EXCLUSION_RECTS; i++) {
+        char name[32];
+        snprintf(name, sizeof name, "exclusion_rects[%d]", i);
+        float x = exclusionRects[i][0], y = exclusionRects[i][1], w = exclusionRects[i][2], h = exclusionRects[i][3];
+
+        // Sim-space bounds (repel.frag's wall splat): logical px -> sim px is a plain
+        // scale (mouse_scale) -- sim-space y is top-down, same as logical px, no flip needed
+        // (matches how mouse_position is scaled in the front-end).
+        float sim_rect[4] = {x * mouse_scale, y * mouse_scale, (x + w) * mouse_scale, (y + h) * mouse_scale};
+        shader_set_uniform_vec(&repelShader, name, 4, sim_rect);
+
+        // Render-buffer-pixel bounds (debug.frag's overlay): logical px -> render px is a
+        // render_scale divide PLUS a y-flip (gl_FragCoord is y-up/bottom-origin; logical px,
+        // like the mouse, is top-down) -- mirrors how screen.vert/density.vert project
+        // positions into their own render targets.
+        float render_rect[4] = {
+            x / (float)render_scale,
+            (float)height - (y + h) / (float)render_scale,
+            (x + w) / (float)render_scale,
+            (float)height - y / (float)render_scale,
+        };
+        shader_set_uniform_vec(&debugShader, name, 4, render_rect);
+    }
 }
 
 void updateShaderWindowShape(int new_width, int new_height) {
@@ -1004,11 +1136,14 @@ void updateShaderWindowShape(int new_width, int new_height) {
     shader_set_uniform_vec(&positionShader, "window_shape", 2, sim_shape);
     shader_set_uniform_vec(&velocityShader, "window_shape", 2, sim_shape);
     shader_set_uniform_vec(&trailShader, "window_shape", 2, sim_shape);
+    shader_set_uniform_vec(&repelShader, "window_shape", 2, sim_shape);
 
     // screen.frag samples the density buffer by gl_FragCoord, which is in render-buffer pixels,
     // so it needs the render resolution (width/height), not the sim space.
     float render_shape[2] = {(float)width, (float)height};
     shader_set_uniform_vec(&screenShader, "render_shape", 2, render_shape);
+
+    push_exclusion_rects();
 
     // The screen buffer is the final upscale target, so it takes the actual window (framebuffer) size.
     screenBuffer.width = window_width;
@@ -1038,6 +1173,8 @@ void buffer_setup(void) {
     // Derived buffer sizes, now that width/height are final (set in the front-end's window setup)
     density_width = width / densityBufferDownsampling + 1;
     density_height = height / densityBufferDownsampling + 1;
+    repel_width = width / repelBufferDownsampling + 1;
+    repel_height = height / repelBufferDownsampling + 1;
     trail_width = width / trailBufferDownsampling + 1;
     trail_height = height / trailBufferDownsampling + 1;
 
@@ -1099,8 +1236,8 @@ void buffer_setup(void) {
     }
 
     // Initalise textures and the associated framebuffers
-    glGenTextures(8, textures);
-    glGenFramebuffers(8, framebuffers);
+    glGenTextures(9, textures);
+    glGenFramebuffers(9, framebuffers);
 
     // Texture 0 - Density buffer
     densityBuffer.minmag_filter = densityNearest ? GL_NEAREST : GL_LINEAR; // --dens-nearest for chunky pixels
@@ -1113,6 +1250,15 @@ void buffer_setup(void) {
     // Seed 0 in auto mode so ema()'s seed-on-zero snaps to the FIRST measured level instead of
     // ramping from a guessed constant (that ramp showed as faint -> bright over the first ~1/attack frames).
     headroom_ema = (float)(renderHeadroom > 0.0 ? renderHeadroom : 0.0);
+
+    // Texture 8 - Repel buffer (r = force potential, g = dispersion). Single-buffered and
+    // stateless: fully cleared + re-splatted every sim_step (see the repel pass), so it
+    // has no "other" half and never flips. Its own resolution knob (--repel-downsample), decoupled
+    // from the density buffer -- this sets the hardness floor for the edge/exclusion/mouse repel.
+    repelBuffer.minmag_filter = GL_LINEAR;
+    repelBuffer.wrap_st = GL_REPEAT; // matches density/trail: velocity.frag samples it the same way
+    repelBuffer.dim = BE_2D;
+    buffer_allocate(&repelBuffer, current, repelBufferIndex, repel_width, repel_height, NULL);
 
     positionBuffer.minmag_filter = GL_NEAREST;
     positionBuffer.dim = BE_2D;
@@ -1317,6 +1463,10 @@ void sim_resize(int logical_w, int logical_h, int fb_w, int fb_h) {
     // floats into it, so a grow-resize overflows the setup-sized buffer (same class as
     // the sort_counts realloc below). Same generous +8 padding as buffer_setup.
     density_readback = (float *)realloc(density_readback, (size_t)(density_width + 8) * (density_height + 8) * sizeof(float));
+    // Repel buffer has its own resolution knob (--repel-downsample); recompute + realloc.
+    repel_width = width / repelBufferDownsampling + 1;
+    repel_height = height / repelBufferDownsampling + 1;
+    buffer_reallocate(&repelBuffer, current, repel_width, repel_height);
     trail_width = width / trailBufferDownsampling + 1;
     trail_height = height / trailBufferDownsampling + 1;
     buffer_reallocate(&trailBuffer, current, trail_width, trail_height);
@@ -1354,10 +1504,13 @@ static void sim_apply_static_uniforms(void) {
     shader_set_uniform_int(&velocityShader, "legacy_wedge", legacyWedge ? 1 : 0);
     shader_set_uniform_float(&velocityShader, "density_force", (float)densityForce);
     shader_set_uniform_float(&velocityShader, "trail_force", (float)trailForce);
-    shader_set_uniform_float(&velocityShader, "edge_repell_coefficient", (float)edgeRepel);
-    shader_set_uniform_float(&velocityShader, "density_reach", (float)densityReach);
+    shader_set_uniform_float(&velocityShader, "repel_coefficient", (float)repel);
+    shader_set_uniform_float(&velocityShader, "reach", (float)reach);
+    shader_set_uniform_float(&velocityShader, "anti_stick", (float)antiStick);
     shader_set_uniform_float(&velocityShader, "trail_reach", (float)trailReach);
     shader_set_uniform_int(&velocityShader, "density_buffer", densityBuffer.current);
+    // repelBuffer is single-buffered (no ping-pong), so its texture unit never changes.
+    shader_set_uniform_int(&velocityShader, "repel_buffer", repelBuffer.current);
     // Trail spread-deposit (--trail-every N): the trail decays EVERY frame (smooth fade,
     // no frozen-field discontinuity), but each frame deposits only a rotating 1/N subset
     // of the trail particles. With the per-point intensity scaled by N, the per-frame
@@ -1398,10 +1551,24 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
         _tp = get_time();
     }
 
+    // Interaction pass: fully clear + re-splat the force-potential (r) / dispersion (g) field
+    // from scratch every frame -- bounding-rect edges, exclusion rects (--exclusions), and the
+    // mouse. Single-buffered and stateless (no flip), so it's just a plain overwrite. Must run
+    // BEFORE the velocity pass, which reads the fully-written result for this frame.
+    shader_use(&repelShader);
+    shader_set_uniform_vec(&repelShader, "mouse_position", 2, (float *)mouse_position);
+    shader_set_uniform_vec(&repelShader, "mouse_velocity", 2, (float *)mouse_velocity);
+    shader_set_uniform_vec(&repelShader, "buffer_shape", 2, (float[]){(float)repel_width, (float)repel_height});
+    buffer_bind(&repelBuffer, current);
+    buffer_update(&repelBuffer);
+
     // Velocity pass
     shader_use(&velocityShader);
     shader_set_uniform_vec(&velocityShader, "mouse_position", 2, (float *)mouse_position);
     shader_set_uniform_vec(&velocityShader, "mouse_velocity", 2, (float *)mouse_velocity);
+    // repel buffer's resolution -- velocity.frag needs it to size the one-texel step of the
+    // local-gradient repel (a hard-edged central difference, not the reach-wide VDI).
+    shader_set_uniform_vec(&velocityShader, "buffer_shape", 2, (float[]){(float)repel_width, (float)repel_height});
     shader_set_uniform_int(&velocityShader, "position_buffer", positionBuffer.current);
     shader_set_uniform_int(&velocityShader, "velocity_buffer", velocityBuffer.current);
     shader_set_uniform_int(&velocityShader, "trail_buffer", trailBuffer.current);
@@ -1504,6 +1671,41 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
                              renderHeadroom > 0.0 ? (float)renderHeadroom : headroom_ema);
     // Draw in tile-coherent order via the index buffer (ibo stays bound in the VAO).
     glDrawElements(GL_POINTS, P, GL_UNSIGNED_INT, 0);
+
+    // Debug overlay: composite flat translucent-green fills into the render target (so they show
+    // up in --dump/--headless which read renderBuffer, and regardless of particle density). Gated
+    // on the C-side flags -> a normal run pays nothing. renderBuffer is still bound and blend is on
+    // (SRC_ALPHA over). Fullscreen quad via gl_VertexID; the bound VAO needs no attributes.
+    //  - exclusions_debug: fill each exclusion rect (rects live on the shader from push_exclusion_rects).
+    //  - mouse_debug: fill the mouse repel-interaction disc. Radius is the same speed-scaled clamp the
+    //    physics uses (repel.frag: clamp(speed*3, 30, 75) sim px -- constants mirrored here for the
+    //    viz). sim px -> render px is * SIM_SCALE/render_scale; sim y is top-origin, gl_FragCoord is
+    //    bottom-origin, so y flips. A parked mouse sits far off-screen, so its disc covers nothing.
+    //  - edge_debug: fill the bounding-edge repel bands (render_shape lets the shader size them).
+    //  - mouse_debug also draws the opaque cursor dot + a motion line from last frame's cursor
+    //    position (mouse_prev = current - per-frame velocity) to the current one.
+    if (exclusions_debug || mouse_debug || edge_debug) {
+        shader_use(&debugShader);
+        shader_set_uniform_int(&debugShader, "draw_exclusions", exclusions_debug ? 1 : 0);
+        shader_set_uniform_int(&debugShader, "draw_mouse", mouse_debug ? 1 : 0);
+        shader_set_uniform_int(&debugShader, "draw_edges", edge_debug ? 1 : 0);
+        shader_set_uniform_vec(&debugShader, "render_shape", 2, (float[]){(float)width, (float)height});
+        // repel buffer's own resolution -- lets the overlay snap to that (downsampled) texel
+        // grid, so it shows the ACTUAL coarse field the physics samples, not the ideal shape.
+        shader_set_uniform_vec(&debugShader, "buffer_shape", 2, (float[]){(float)repel_width, (float)repel_height});
+        float mspeed = sqrtf(mouse_velocity[0] * mouse_velocity[0] + mouse_velocity[1] * mouse_velocity[1]);
+        // ease-out radius, mirrors repel.frag/velocity.frag: fast rise at low speed, plateau at max.
+        float mt = fminf(mspeed / 20.0f, 1.0f);
+        float mrad_sim = 30.0f + (75.0f - 30.0f) * (1.0f - (1.0f - mt) * (1.0f - mt));
+        float k = (float)(SIM_SCALE / render_scale);
+        shader_set_uniform_vec(&debugShader, "mouse_center", 2,
+                               (float[]){mouse_position[0] * k, (float)height - mouse_position[1] * k});
+        shader_set_uniform_vec(&debugShader, "mouse_prev", 2,
+                               (float[]){(mouse_position[0] - mouse_velocity[0]) * k,
+                                         (float)height - (mouse_position[1] - mouse_velocity[1]) * k});
+        shader_set_uniform_float(&debugShader, "mouse_radius", mrad_sim * k);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
     LAP(4);
 }
 

@@ -80,6 +80,7 @@ const vec4 color2 = vec4(0.925f, 0.69f, 0.208f, 0.8f);
 
 void main() {
     vec2 position = gl_FragCoord.xy;
+
     float density = texture(density_buffer, position/render_shape).x;
 
     // NOTE: the stochastic density cull now happens in the vertex shader (pre-binning),

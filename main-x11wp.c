@@ -14,7 +14,6 @@
 #include <string.h>
 
 #include <gl.h>
-#include "shader.h" // debugShader for --mouse-debug
 
 #define RGFW_OPENGL
 #define RGFWDEF // implementation lives in rgfw_impl.c
@@ -264,19 +263,8 @@ int main(int argc, char **argv) {
             glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // restore so the next frame's clears stay black
         }
 
-        // --mouse-debug: green dot (+ trail) at where the sim sees the cursor.
-        static float debug_prev[2] = {0.0f, 0.0f};
-        if (mouse_debug && mouse_on) {
-            float win_shape[2] = {(float)window_width, (float)window_height};
-            float positions[4] = {debug_prev[0], debug_prev[1], mouse_px[0], mouse_px[1]};
-            shader_use(&debugShader);
-            shader_set_uniform_vec(&debugShader, "window_shape", 2, win_shape);
-            glUniform2fv(glGetUniformLocation(debugShader.program, "positions"), 2, positions);
-            glDrawArrays(GL_LINES, 0, 2);
-            glDrawArrays(GL_POINTS, 1, 1);
-            debug_prev[0] = mouse_px[0];
-            debug_prev[1] = mouse_px[1];
-        }
+        // --mouse-debug cursor dot + motion line now render in the shared debug overlay pass
+        // (sim_step -> debugShader), alongside the exclusion/edge fills.
 
         double frame_now = get_time();
         frame_ms = ema(frame_ms, (frame_now - frame_prev) * 1000.0, 0.1);
@@ -302,8 +290,8 @@ int main(int argc, char **argv) {
     }
 
     glBindVertexArray(0);
-    glDeleteTextures(8, textures);
-    glDeleteFramebuffers(8, framebuffers);
+    glDeleteTextures(9, textures);
+    glDeleteFramebuffers(9, framebuffers);
     RGFW_window_close(window);
     RGFW_deinit();
     return 0;

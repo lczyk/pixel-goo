@@ -200,24 +200,8 @@ int main(int argc, char **argv) {
                 glClearColor(0.0f, 0.0f, 0.0f, 1.0f); // restore so the next frame's clears stay black
             }
 
-            // Mouse debug overlay: green dot at cursor + line from prev to current position.
-            // Use raw logical window coords (xpos/ypos) so the overlay matches the actual cursor.
-            static float debug_prev[2] = {0.0f, 0.0f};
-            if (mouse_debug && mouse_in_window) {
-                float win_shape[2] = {(float)window_width, (float)window_height};
-                float debug_cur[2] = {(float)xpos * dpi_scale, (float)ypos * dpi_scale};
-                float positions[4] = {debug_prev[0], debug_prev[1], debug_cur[0], debug_cur[1]};
-                shader_use(&debugShader);
-                shader_set_uniform_vec(&debugShader, "window_shape", 2, win_shape);
-                glUniform2fv(glGetUniformLocation(debugShader.program, "positions"), 2, positions);
-                // NOTE: GL_PROGRAM_POINT_SIZE is enabled once globally at setup and the density/
-                // trail splat passes depend on it -- don't toggle it here or those passes collapse
-                // to 1px points and the whole field jumps. gl_PointSize=8 in debug.vert still applies.
-                glDrawArrays(GL_LINES, 0, 2);  // trail from prev to current
-                glDrawArrays(GL_POINTS, 1, 1); // dot at current (index 1)
-                debug_prev[0] = debug_cur[0];
-                debug_prev[1] = debug_cur[1];
-            }
+            // --mouse-debug cursor dot + motion line now render in the shared debug overlay pass
+            // (sim_step -> debugShader), alongside the exclusion/edge fills.
 
             if (profile && epoch_counter % 60 == 0) {
                 double tot = 0;
@@ -310,8 +294,8 @@ int main(int argc, char **argv) {
     // Clean up
     // TODO: clean up after oneself better
     glBindVertexArray(0);
-    glDeleteTextures(8, textures);
-    glDeleteFramebuffers(8, framebuffers);
+    glDeleteTextures(9, textures);
+    glDeleteFramebuffers(9, framebuffers);
     RGFW_window_close(window);
     RGFW_deinit();
     return 0;
