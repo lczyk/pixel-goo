@@ -37,6 +37,11 @@ int width = 0;
 int height = 0;
 int window_width = 800; // actual framebuffer size in device px; the upscale target
 int window_height = 600;
+// upscale source-crop (uv), pushed by sim_present. Identity = straight upscale, the
+// default for every front-end; macwp -m=-2 narrows it to a centred sub-rect so a
+// shared field presents 1:1 on each monitor (crop, not stretch) -- see main-macwp.m.
+float present_uv_min[2] = {0.0f, 0.0f};
+float present_uv_max[2] = {1.0f, 1.0f};
 double render_scale = 0; // internal res = logical points / render_scale (>1 = lower res, faster); --render-scale
 // SIM_SCALE fixes the simulation coordinate space at logical/SIM_SCALE px, INDEPENDENT of render_scale.
 // This makes render_scale a pure fidelity knob (changing -r never alters the dynamics) and a window
@@ -843,7 +848,7 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
     // (clone to a monitor / all monitors) only makes sense for goo-macwp.
     dropt_option macwp_opts[] = {
         {'\0', NULL, "\nWALLPAPER", NULL, NULL, NULL},
-        {'m', "monitor", "Monitor to render the wallpaper on (-1 = clone to all monitors; default 0 = main).", "N",
+        {'m', "monitor", "Monitor for the wallpaper (-1 = clone+stretch to all; -2 = clone to all, centre-crop no stretch; default 0 = main).", "N",
          parse_int, &whichMonitor},
     };
 
@@ -1726,6 +1731,10 @@ void sim_present(void) {
     glDisable(GL_BLEND);
     shader_use(&upscaleShader);
     shader_set_uniform_int(&upscaleShader, "source_buffer", renderBuffer.current);
+    // Source crop: identity (full field) for every normal present; macwp -m=-2 sets a
+    // centred sub-rect so each monitor shows its own 1:1 slice of the shared field.
+    shader_set_uniform_vec(&upscaleShader, "uv_min", 2, present_uv_min);
+    shader_set_uniform_vec(&upscaleShader, "uv_max", 2, present_uv_max);
     buffer_update(&screenBuffer);
     glEnable(GL_BLEND);
 }

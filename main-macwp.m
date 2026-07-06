@@ -5,11 +5,13 @@
 // SIGINT/SIGTERM it closes the windows cleanly, so the normal desktop picture
 // reappears -- no save/restore needed.
 //
-// -m selects the monitor (-1 = clone the same sim onto every monitor). Cloning is
-// one sim + one GL context shared across N windows: sim_step runs once, then we
-// re-point the single context at each window (setView) and present the same field.
-// One context means the VAO / texture bindings stay valid -- N independent sims
-// would need N processes (the sim core is a singleton), which we don't want here.
+// -m selects the monitor (-1 = clone the same sim onto every monitor, stretched to
+// each; -2 = same clone but sized to the largest monitor and centre-cropped 1:1 per
+// monitor instead of stretched, so mismatched-aspect monitors don't distort).
+// Cloning is one sim + one GL context shared across N windows: sim_step runs once,
+// then we re-point the single context at each window (setView) and present the same
+// field. One context means the VAO / texture bindings stay valid -- N independent
+// sims would need N processes (the sim core is a singleton), which we don't want here.
 //
 // Not RGFW: a desktop-level all-Spaces click-through window needs NSWindow knobs
 // (level / collectionBehavior / ignoresMouseEvents) RGFW doesn't expose, so this
@@ -98,8 +100,10 @@ int main(int argc, char **argv) {
         if ([all count] == 0)
             die("no screens");
 
-        // Pick the target screens: -1 clones onto every monitor; otherwise a single
-        // monitor by index (0 = main), clamped into range.
+        // Pick the target screens: negative clones onto every monitor; otherwise a
+        // single monitor by index (0 = main), clamped into range. -2 additionally
+        // switches the per-monitor present from stretch to centre-crop (see below).
+        bool crop_mode = (whichMonitor == -2);
         NSMutableArray<NSScreen *> *screens = [NSMutableArray array];
         if (whichMonitor < 0) {
             [screens addObjectsFromArray:all];
@@ -159,6 +163,24 @@ int main(int argc, char **argv) {
         int logical_h = (int)ref_frame.size.height;
         int fb_w, fb_h;
         screen_backing_px(ref, &fb_w, &fb_h);
+        if (crop_mode) {
+            // Crop mode: size the shared field to the componentwise-max monitor dims
+            // (largest width and largest height found -- possibly from different
+            // monitors), so every monitor fits inside it and shows a centred 1:1 crop
+            // rather than a stretch. fb only seeds the upscale target here; the present
+            // loop overwrites window_/screenBuffer size per monitor anyway.
+            double max_w = 0, max_h = 0;
+            for (NSScreen *s in screens) {
+                NSRect f = [s frame];
+                if (f.size.width > max_w) max_w = f.size.width;
+                if (f.size.height > max_h) max_h = f.size.height;
+            }
+            logical_w = (int)max_w;
+            logical_h = (int)max_h;
+            double k = [ref backingScaleFactor];
+            fb_w = (int)(max_w * k);
+            fb_h = (int)(max_h * k);
+        }
         sim_set_dims(logical_w, logical_h, fb_w, fb_h);
 
         sim_setup();
@@ -213,10 +235,18 @@ int main(int argc, char **argv) {
                         }
                     }
                     if (in) {
-                        // fraction within the hit screen -> shared logical coords (stretched
-                        // for monitors of a different size, same as the visual upscale).
-                        double lx = (m.x - hit.origin.x) / hit.size.width * logical_w;
-                        double ly_bottom = (m.y - hit.origin.y) / hit.size.height * logical_h;
+                        // Cursor -> shared logical coords, matching the visual mapping:
+                        //  - stretch (-1): fraction within the hit screen scaled to the field.
+                        //  - crop (-2): 1:1, offset by this monitor's centred crop origin so
+                        //    the cursor lands on the same particle it visually hovers.
+                        double lx, ly_bottom;
+                        if (crop_mode) {
+                            lx = (logical_w - hit.size.width) * 0.5 + (m.x - hit.origin.x);
+                            ly_bottom = (logical_h - hit.size.height) * 0.5 + (m.y - hit.origin.y);
+                        } else {
+                            lx = (m.x - hit.origin.x) / hit.size.width * logical_w;
+                            ly_bottom = (m.y - hit.origin.y) / hit.size.height * logical_h;
+                        }
                         mouse_position[0] = (float)lx * mouse_scale;
                         // sim space is top-origin; cocoa screen y is bottom-up -- flip.
                         mouse_position[1] = (float)(logical_h - ly_bottom) * mouse_scale;
@@ -247,8 +277,24 @@ int main(int argc, char **argv) {
 #pragma clang diagnostic pop
                         [ctx update]; // drawable changed; refresh the context's view binding
                     }
+                    NSScreen *s = [screens objectAtIndex:i];
+                    if (crop_mode) {
+                        // Show only the centred fraction of the field that matches this
+                        // monitor's own size, at 1:1 (fx,fy <= 1 since the field is sized
+                        // to the max monitor). Identical points-per-pixel as the reference
+                        // -> no stretch; smaller monitors just see less of the field.
+                        NSRect f = [s frame];
+                        double fx = f.size.width / (double)logical_w;
+                        double fy = f.size.height / (double)logical_h;
+                        if (fx > 1.0) fx = 1.0;
+                        if (fy > 1.0) fy = 1.0;
+                        present_uv_min[0] = (float)((1.0 - fx) * 0.5);
+                        present_uv_min[1] = (float)((1.0 - fy) * 0.5);
+                        present_uv_max[0] = (float)((1.0 + fx) * 0.5);
+                        present_uv_max[1] = (float)((1.0 + fy) * 0.5);
+                    }
                     int pw, ph;
-                    screen_backing_px([screens objectAtIndex:i], &pw, &ph);
+                    screen_backing_px(s, &pw, &ph);
                     window_width = pw;
                     window_height = ph;
                     screenBuffer.width = pw;
