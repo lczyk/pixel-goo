@@ -629,10 +629,13 @@ static const char *token_flag_name(const char *tok, char *out, size_t cap) {
 // goo-wlwp (wallpaper) excludes these from its option table AND skips any matching
 // baked-in default, so they neither show in --help nor parse on its cli.
 static bool is_window_only(const char *name) {
+    // NOTE: exclusions/*-debug are NOT here -- they work on the wallpapers via the shared sim core
+    // (exclusion physics + the sim_step debug overlay pass), so wlwp/macwp/x11wp expose them too.
+    // corners-debug stays window-only: it's drawn by glScissor in the RGFW front-end loops, which
+    // the wallpapers don't have.
     static const char *w[] = {
         "monitor", "windowed", "no-border", "width", "height", "fps",
-        "mouse-debug", "corners-debug", "no-keyfocus-steal", "profile",
-        "dump", "headless", "exclusions", "exclusions-debug", "edge-debug"};
+        "corners-debug", "no-keyfocus-steal", "profile", "dump", "headless"};
     for (size_t i = 0; i < sizeof w / sizeof w[0]; i++)
         if (strcmp(name, w[i]) == 0)
             return true;
@@ -780,6 +783,20 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_bool, &legacy_wedge},
         {'N', "iterations", "Exit after N presented frames (0 = unlimited); for benchmarking.", "N",
          parse_int, &max_iterations},
+
+        // Shared by the window AND the wallpapers -- exclusion physics + the debug overlays live
+        // in the sim core (sim_step), so every front-end exposes them.
+        {'\0', NULL, "\nEXCLUSIONS", NULL, NULL, NULL},
+        {'\0', "exclusions", "Exclusion primitives cut from the sim domain: \"rect(x,y,w,h);rect(x,y,w,h);...\" in logical px (max 16; only 'rect' is implemented).", "PRIMITIVES",
+         parse_exclusions, &exclusionRectCount},
+
+        {'\0', NULL, "\nDEBUG", NULL, NULL, NULL},
+        {'\0', "mouse-debug", "Draw the mouse cursor dot + motion line + repel-radius disc.", NULL,
+         dropt_handle_bool, &mouse_debug},
+        {'\0', "exclusions-debug", "Blend a green tint over excluded regions (debug: visualise exclusion-primitive placement).", NULL,
+         dropt_handle_bool, &exclusions_debug},
+        {'\0', "edge-debug", "Blend a green tint over the bounding-edge repel bands (debug: visualise the edge repel regions).", NULL,
+         dropt_handle_bool, &edge_debug},
     };
 
     // Window-only options: geometry, input, file output -- meaningless for a
@@ -799,15 +816,9 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
         {'\0', "fps", "Throttle the average frame rate to N fps (0 = uncapped).", "N",
          parse_int, &fps_cap},
 
-        {'\0', NULL, "\nDEBUG", NULL, NULL, NULL},
-        {'\0', "mouse-debug", "Draw a green dot and trail at the cursor position.", NULL,
-         dropt_handle_bool, &mouse_debug},
+        {'\0', NULL, "\nDEBUG (window-only)", NULL, NULL, NULL},
         {'\0', "corners-debug", "Draw green squares in the window corners (debug viewport mapping).", NULL,
          dropt_handle_bool, &corners_debug},
-        {'\0', "exclusions-debug", "Blend a green tint over excluded regions (debug: visualise exclusion-primitive placement).", NULL,
-         dropt_handle_bool, &exclusions_debug},
-        {'\0', "edge-debug", "Blend a green tint over the bounding-edge repel bands (debug: visualise the edge repel regions).", NULL,
-         dropt_handle_bool, &edge_debug},
         {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
          dropt_handle_bool, &prof},
         // NOTE: macos-only -- samespace cover (Spaces, focus-steal) is meaningless on x11/wayland
@@ -819,8 +830,6 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_string, &dump_path},
         {'\0', "headless", "Render -N frames at render-res, piped to ffmpeg (e.g. out.mp4); no window. Needs ffmpeg.", "OUT",
          dropt_handle_string, &headless_path},
-        {'\0', "exclusions", "Exclusion primitives cut from the sim domain: \"rect(x,y,w,h);rect(x,y,w,h);...\" in logical px (max 16; only 'rect' is implemented).", "PRIMITIVES",
-         parse_exclusions, &exclusionRectCount},
     };
 
     // Wallpaper-only options: only meaningful for the wayland layer-shell front-end.
