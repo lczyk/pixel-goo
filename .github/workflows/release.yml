@@ -50,10 +50,15 @@ jobs:
           done
 
       - name: stage binaries
+        # tar each binary: github strips the +x bit off raw assets (upload-artifact zips
+        # without unix perms), but tar preserves it, so `tar xf` yields a runnable executable.
         run: |
           mkdir -p dist
           for f in bin/goo bin/goo-macwp bin/goo-wlwp bin/goo-x11wp; do
-            [ -f "$f" ] && cp "$f" "dist/$(basename "$f")-${GOO_VERSION}-${{ matrix.label }}"
+            [ -f "$f" ] || continue
+            b=$(basename "$f")
+            chmod +x "$f"
+            tar -czf "dist/${b}-${GOO_VERSION}-${{ matrix.label }}.tar.gz" -C bin "$b"
           done
           ls -l dist
 
