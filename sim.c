@@ -99,7 +99,22 @@ int PB_width = 0;
 int PB_height = 0;
 // PBOs holding position/velocity: filled each frame by glReadPixels(FBO->PBO) and bound
 // as vertex attributes for the point passes (faster than vertex texture fetch on this gpu).
-GLuint pbo_pos = 0;
+//
+// Position is a RING. pbo_pos is filled + bound as the point attribute (loc 0) each frame,
+// but it is ALSO CPU-mapped to build the tile-coherent draw order. Mapping it for read is the
+// stall: on macos GL the map does a conservative pipeline sync -- it blocks even for a slot
+// whose readback landed frames ago, because the buffer is part of vertex-array state -- a
+// periodic ~4ms (up to ~15ms) hit every sort-every frames. So: (1) ring the buffer, filling +
+// attribute-binding a rotating slot each frame; (2) fence each slot when its readback is issued;
+// (3) the sort maps the OLDEST slot with GL_MAP_UNSYNCHRONIZED_BIT (skips the driver sync), but
+// only once that slot's fence says the readback has actually landed -- otherwise it skips the
+// rebuild and keeps the prior order. The sort is a coherence-only optimisation (any positions
+// yield a valid permutation), so a skipped or slightly-stale rebuild never affects correctness.
+// Velocity is single-buffered: it is never mapped, only streamed as loc 1.
+#define POS_PBO_N 4
+GLuint pbo_pos[POS_PBO_N] = {0};
+int pos_pbo_ring = 0;              // next ring slot to write (this frame's positions)
+GLsync pos_fence[POS_PBO_N] = {0}; // per-slot fence: signalled when that slot's readback lands
 GLuint pbo_vel = 0;
 
 Shader screenShader = {.name = "screenShader"};
@@ -321,17 +336,31 @@ int *sort_counts = NULL;       // (nbuckets+1) histogram / prefix-sum scratch
 const int sort_tile = 32;      // screen tile size in px (~AGX tile granularity)
 int sort_every = 0;            // rebuild the order every N frames (1 = every frame)
 
-// Counting-sort the P particle indices by screen tile, using the positions currently
-// in pbo_pos. Uploads the result into ibo. O(P), two linear passes. Out-of-bounds
-// positions are clamped (only affects coherence, never correctness).
+// Counting-sort the P particle indices by screen tile, using positions from the OLDEST pbo_pos
+// ring slot -- mapped GL_MAP_UNSYNCHRONIZED_BIT (no driver sync) once its fence proves the
+// readback landed (see the ring note above). Uploads the result into ibo. O(P), two linear
+// passes. Out-of-bounds positions are clamped (only affects coherence, never correctness).
 static void rebuild_sort_order(void) {
+    int oldest = (pos_pbo_ring + 1) % POS_PBO_N; // least-recently written this ring cycle
+
+    // Only read a slot whose readback has actually landed. Poll the fence (timeout 0, no flush --
+    // prior frames' swaps already flushed it). Not signalled, or never filled (startup priming),
+    // -> skip this rebuild and keep the prior order (the sort is coherence-only).
+    GLsync f = pos_fence[oldest];
+    if (f == NULL)
+        return;
+    GLenum st = glClientWaitSync(f, 0, 0);
+    if (st != GL_ALREADY_SIGNALED && st != GL_CONDITION_SATISFIED)
+        return;
+
     int tilesW = (width + sort_tile - 1) / sort_tile;
     int tilesH = (height + sort_tile - 1) / sort_tile;
     int nb = tilesW * tilesH;
     float inv_tile = 1.0f / (float)sort_tile;
 
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
-    float *pos = (float *)glMapBuffer(GL_PIXEL_PACK_BUFFER, GL_READ_ONLY);
+    size_t map_bytes = (size_t)PB_width * PB_height * 2 * sizeof(float);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos[oldest]);
+    float *pos = (float *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, map_bytes, GL_MAP_READ_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
     if (!pos) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
         return;
@@ -1249,9 +1278,17 @@ void buffer_setup(void) {
     // by glReadPixels(FBO->PBO), then reused as GL_ARRAY_BUFFER so the point passes
     // read positions/velocities as streamed attributes instead of vertex texture fetch.
     size_t pb_bytes = (size_t)PBwidth * PBheight * 2 * sizeof(float);
-    glGenBuffers(1, &pbo_pos);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
-    glBufferData(GL_PIXEL_PACK_BUFFER, pb_bytes, NULL, GL_DYNAMIC_COPY);
+    // Position PBO ring (see the ring note by the pbo_pos declaration). P is fixed, so these
+    // are never resized -- only regenerated if buffer_setup re-runs on a context recreate.
+    glGenBuffers(POS_PBO_N, pbo_pos);
+    for (int i = 0; i < POS_PBO_N; i++) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos[i]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, pb_bytes, NULL, GL_DYNAMIC_COPY);
+    }
+    pos_pbo_ring = 0;
+    // Abandon any fences from a prior context (they died with it); a fresh ring starts unfilled.
+    for (int i = 0; i < POS_PBO_N; i++)
+        pos_fence[i] = 0;
     glGenBuffers(1, &pbo_vel);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_vel);
     glBufferData(GL_PIXEL_PACK_BUFFER, pb_bytes, NULL, GL_DYNAMIC_COPY);
@@ -1259,7 +1296,8 @@ void buffer_setup(void) {
 
     // Wire the PBOs as vertex attributes (position = loc 0, velocity = loc 1) on the
     // still-bound VAO, so the point passes stream them instead of vertex texture fetch.
-    glBindBuffer(GL_ARRAY_BUFFER, pbo_pos);
+    // Position starts on ring slot 0; sim_step re-points it at the freshly filled slot each frame.
+    glBindBuffer(GL_ARRAY_BUFFER, pbo_pos[0]);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
     glBindBuffer(GL_ARRAY_BUFFER, pbo_vel);
@@ -1638,24 +1676,36 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
     LAP(1);
 
     // Copy the fresh position + velocity textures into PBOs (FBO -> GL_PIXEL_PACK_BUFFER,
-    // stays on-gpu). Those PBOs are bound as the point passes' vertex attributes, and
-    // pbo_pos is also CPU-mapped to build the tile-coherent draw order.
+    // stays on-gpu). Velocity into pbo_vel; position into this frame's ring slot (async).
     glBindFramebuffer(GL_READ_FRAMEBUFFER, positionBuffer.framebuffers[positionBuffer.current]);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_pos[pos_pbo_ring]);
     glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, 0);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, velocityBuffer.framebuffers[velocityBuffer.current]);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, pbo_vel);
     glReadPixels(0, 0, PB_width, PB_height, GL_RG, GL_FLOAT, 0);
     glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    // Re-point the position vertex attribute (loc 0) at the slot just filled, so the point
+    // passes below draw THIS frame's positions. (The VAO is still bound from buffer_setup.)
+    glBindBuffer(GL_ARRAY_BUFFER, pbo_pos[pos_pbo_ring]);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, 0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    // Fence this slot's readback so rebuild_sort_order can poll (a few frames later) whether it
+    // has landed before mapping it unsynchronized. Replace the slot's previous fence.
+    if (pos_fence[pos_pbo_ring])
+        glDeleteSync(pos_fence[pos_pbo_ring]);
+    pos_fence[pos_pbo_ring] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     LAP(6);
 
-    // Rebuild the tile-coherent draw order from the freshly read-back positions.
+    // Rebuild the tile-coherent draw order. rebuild_sort_order maps the OLDEST ring slot
+    // unsynchronized, gated on that slot's fence -- it self-skips until the ring has a landed
+    // readback (startup) or if the readback is momentarily behind, keeping the prior order.
     if (sort_every > 0 && epoch_counter % sort_every == 0) {
         double s0 = get_time();
         rebuild_sort_order();
         pass_ms[7] = ema(pass_ms[7], (get_time() - s0) * 1000.0, 0.1);
     }
+    pos_pbo_ring = (pos_pbo_ring + 1) % POS_PBO_N;
 
     // Density buffer pass. Amortised: the density field is a slow-moving snapshot,
     // and the buffer isn't flipped, so on skipped frames it just keeps the last

@@ -68,7 +68,6 @@ extern const PBindex trailBufferIndex2;
 extern const PBindex renderBufferIndex;
 extern const PBindex repelBufferIndex;
 extern int PB_width, PB_height;
-extern GLuint pbo_pos, pbo_vel;
 
 extern Shader screenShader, densityShader, positionShader, velocityShader;
 extern Shader copyShader, trailShader, upscaleShader, debugShader, repelShader;
