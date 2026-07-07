@@ -136,14 +136,26 @@ int main(int argc, char **argv) {
         NSOpenGLPixelFormat *pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
         if (!pf)
             die("no 4.1-core pixel format");
-        NSOpenGLContext *ctx = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:nil];
-        if (!ctx)
-            die("NSOpenGLContext failed");
-        [ctx setView:views[0]]; // bootstrap on the first screen; present re-points per frame
-#pragma clang diagnostic pop
-        [ctx makeCurrentContext];
+        // One GL context PER window, all sharing the first (shareContext), so they share the sim's
+        // textures / programs / buffers. Each context keeps its own view for the window's lifetime,
+        // so presenting a monitor is just makeCurrent + draw + flush -- no per-frame setView/update
+        // drawable re-point (expensive on the GL-over-Metal path, and it stutters the compositor).
+        // ctxs[0] owns the sim: the VAO and texture-unit bindings are per-context (not shared), so
+        // sim_step must always run current on ctxs[0].
         GLint swap = vsync ? 1 : 0;
-        [ctx setValues:&swap forParameter:NSOpenGLContextParameterSwapInterval];
+        NSOpenGLContext **ctxs = calloc(nwin, sizeof(NSOpenGLContext *));
+        if (!ctxs)
+            die("out of memory");
+        for (NSUInteger i = 0; i < nwin; i++) {
+            ctxs[i] = [[NSOpenGLContext alloc] initWithFormat:pf shareContext:(i == 0 ? nil : ctxs[0])];
+            if (!ctxs[i])
+                die("NSOpenGLContext failed");
+            [ctxs[i] setView:views[i]];
+            [ctxs[i] setValues:&swap forParameter:NSOpenGLContextParameterSwapInterval];
+        }
+        NSOpenGLContext *ctx = ctxs[0]; // the sim-owning context
+        [ctx makeCurrentContext];
+#pragma clang diagnostic pop
 
         if (!gladLoaderLoadGL()) // dlopens OpenGL.framework; no NSOpenGL getProcAddress needed
             die("gladLoaderLoadGL failed");
@@ -183,7 +195,21 @@ int main(int argc, char **argv) {
         }
         sim_set_dims(logical_w, logical_h, fb_w, fb_h);
 
-        sim_setup();
+        sim_setup(); // runs on ctxs[0]: builds the shared textures/buffers + the sim VAO
+
+        // Prime each secondary context (clone mode only). They share the sim's texture and buffer
+        // OBJECTS, but container/binding state is per-context: each needs its own VAO (core profile
+        // requires one bound even for the gl_VertexID upscale quad) and its own texture-unit binding
+        // for the render target the upscale samples (unit bindings aren't shared; the texture is).
+        for (NSUInteger i = 1; i < nwin; i++) {
+            [ctxs[i] makeCurrentContext];
+            GLuint vao;
+            glGenVertexArrays(1, &vao);
+            glBindVertexArray(vao);
+            glActiveTexture(GL_TEXTURE0 + renderBufferIndex);
+            glBindTexture(GL_TEXTURE_2D, textures[renderBufferIndex]);
+        }
+        [ctx makeCurrentContext]; // back to the sim-owning context for setup + the loop
 
         // orderFront, not makeKeyAndOrderFront -- a wallpaper never takes key focus.
         for (NSUInteger i = 0; i < nwin; i++)
@@ -265,18 +291,17 @@ int main(int argc, char **argv) {
                 prev_mouse[1] = mouse_position[1];
 
                 sim_step(epoch_counter, mouse_position, mouse_velocity);
+                // Clone mode: sim_step wrote the shared render target on ctxs[0]; flush so the
+                // secondary contexts see the finished writes before they sample it below.
+                if (nwin > 1)
+                    glFlush();
 
-                // Present the one field to every target screen: size the upscale to that
-                // monitor's backing store and swap. Single window = the common case, where
-                // the view is set once at bootstrap, so skip the per-frame setView/update.
+                // Present the one field to every target screen: make its own context current, size
+                // the upscale to that monitor's backing store, draw, and swap. Single window = the
+                // common case: one context, always current, no makeCurrent churn.
                 for (NSUInteger i = 0; i < nwin; i++) {
-                    if (nwin > 1) { // re-point the shared context only when cloning
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-                        [ctx setView:views[i]]; // setView deprecated (NSOpenGLView); see make_wallpaper_window
-#pragma clang diagnostic pop
-                        [ctx update]; // drawable changed; refresh the context's view binding
-                    }
+                    if (nwin > 1)
+                        [ctxs[i] makeCurrentContext]; // this monitor's own context (cheap vs setView)
                     NSScreen *s = [screens objectAtIndex:i];
                     if (crop_mode) {
                         // Show only the centred fraction of the field that matches this
@@ -300,8 +325,10 @@ int main(int argc, char **argv) {
                     screenBuffer.width = pw;
                     screenBuffer.height = ph;
                     sim_present();
-                    [ctx flushBuffer]; // swap; vsync (swap interval) paces the loop
+                    [ctxs[i] flushBuffer]; // swap; vsync (swap interval) paces the loop
                 }
+                if (nwin > 1)
+                    [ctx makeCurrentContext]; // restore the sim-owning context for the next sim_step
                 epoch_counter++;
             }
         }
@@ -315,6 +342,7 @@ int main(int argc, char **argv) {
             [windows[i] close];
         free(windows);
         free(views);
+        free(ctxs);
     }
     return 0;
 }
