@@ -240,8 +240,8 @@ static bool check_wlwp_deps(void) {
 #else
     bool ok = true;
     struct {
-        const char *pkg;     // pkg-config name
-        const char *apt;     // package to install
+        const char *pkg; // pkg-config name
+        const char *apt; // package to install
     } pkgs[] = {
         {"wayland-client", "libwayland-dev"},
         {"wayland-egl", "libwayland-dev"},

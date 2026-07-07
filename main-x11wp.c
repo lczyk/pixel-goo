@@ -25,7 +25,7 @@
 #define WIN_TITLE "goo-x11wp"
 
 static RGFW_window *window;
-static i32 g_fbw, g_fbh;            // initial framebuffer size in device px, captured at map
+static i32 g_fbw, g_fbh;           // initial framebuffer size in device px, captured at map
 static bool g_interactive = false; // --mouse: grab pointer for the repel; else click-through, no repel
 
 //============================================================

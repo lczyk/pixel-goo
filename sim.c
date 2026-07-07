@@ -59,26 +59,26 @@ const char *title = "Pixel Goo";
 // exception: it has no default-params entry, so its fallback constant stays.)
 bool fullscreen = true;
 bool vsync = true;
-bool profile = false;              // --profile: glFinish per pass + print ms (disables pipelining)
-int max_iterations = 0;            // -N: exit after N PRESENTED frames (0 = unlimited); for benchmarking
-int warmup = 0;                    // --warmup: simulate this many frames before presenting (skip the boring ramp)
-int fps_cap = 0;                   // --fps: throttle the average fps to this (0 = uncapped)
-bool no_keyfocus_steal = false;    // --no-keyfocus-steal: show window w/out grabbing key focus
-bool no_border = false;            // --no-border: hide the title bar / border in windowed mode
-bool no_mouse = false;             // --no-mouse: disable the mouse repel (park the cursor far off)
-bool mouse_debug = false;          // --mouse-debug: draw green dot + trail at cursor
-bool corners_debug = false;        // --corners-debug: draw green squares in the window corners
-bool exclusions_debug = false;     // --exclusions-debug: tint excluded regions green
-bool edge_debug = false;           // --edge-debug: tint the bounding-edge repel bands green
-char *dump_path = NULL;            // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
+bool profile = false;               // --profile: glFinish per pass + print ms (disables pipelining)
+int max_iterations = 0;             // -N: exit after N PRESENTED frames (0 = unlimited); for benchmarking
+int warmup = 0;                     // --warmup: simulate this many frames before presenting (skip the boring ramp)
+int fps_cap = 0;                    // --fps: throttle the average fps to this (0 = uncapped)
+bool no_keyfocus_steal = false;     // --no-keyfocus-steal: show window w/out grabbing key focus
+bool no_border = false;             // --no-border: hide the title bar / border in windowed mode
+bool no_mouse = false;              // --no-mouse: disable the mouse repel (park the cursor far off)
+bool mouse_debug = false;           // --mouse-debug: draw green dot + trail at cursor
+bool corners_debug = false;         // --corners-debug: draw green squares in the window corners
+bool exclusions_debug = false;      // --exclusions-debug: tint excluded regions green
+bool edge_debug = false;            // --edge-debug: tint the bounding-edge repel bands green
+char *dump_path = NULL;             // --dump <prefix>: debug. at exit, write frame + density + trail to <prefix>_*.ppm
 const char *dump_params_fmt = NULL; // --dump-params[=FORMAT]: print resolved params and exit (NULL = don't)
-char *headless_path = NULL;        // --headless <out>: pipe raw render-res frames to ffmpeg, no window present
-FILE *ffmpeg_pipe = NULL;          // popen handle for the headless encode
-unsigned char *headless_px = NULL; // reusable readback buffer (width*height*3)
-int rng_seed = 0;                  // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
-double init_warp = 0;              // --init-warp: magnitude of the perlin perturbation on initial positions (0 = pure uniform)
-double init_density = 0;           // --density/-d: particles per logical-pixel^2. DEFAULT oracle for P unless -p given.
-bool p_given = false;              // whether -p/--particles was passed -- if so it wins over --density
+char *headless_path = NULL;         // --headless <out>: pipe raw render-res frames to ffmpeg, no window present
+FILE *ffmpeg_pipe = NULL;           // popen handle for the headless encode
+unsigned char *headless_px = NULL;  // reusable readback buffer (width*height*3)
+int rng_seed = 0;                   // --seed <N>: fixed RNG seed for reproducible runs (0 = time-based)
+double init_warp = 0;               // --init-warp: magnitude of the perlin perturbation on initial positions (0 = pure uniform)
+double init_density = 0;            // --density/-d: particles per logical-pixel^2. DEFAULT oracle for P unless -p given.
+bool p_given = false;               // whether -p/--particles was passed -- if so it wins over --density
 int whichMonitor = 0;
 
 // Textures and framebuffers
@@ -92,7 +92,7 @@ const PBindex velocityBufferIndex2 = 4;
 const PBindex trailBufferIndex1 = 5;
 const PBindex trailBufferIndex2 = 6;
 const PBindex renderBufferIndex = 7; // internal colour target, upscaled to the window
-const PBindex repelBufferIndex = 8; // force-potential (r) + dispersion (g); single-buffered, stateless
+const PBindex repelBufferIndex = 8;  // force-potential (r) + dispersion (g); single-buffered, stateless
 
 // Physics buffer dims (square-ish texture holding P particles), set in buffer_setup.
 int PB_width = 0;
@@ -131,8 +131,8 @@ Shader repelShader = {.name = "repelShader"};
 #include "copy.h"
 #include "debug.h"
 #include "density.h"
-#include "repel.h"
 #include "position.h"
+#include "repel.h"
 #include "screen.h"
 #include "trail.h"
 #include "upscale.h"
@@ -201,7 +201,7 @@ int densityBufferDownsampling = 0;
 int density_width = 0; // computed in buffer_setup once width/height are final
 int density_height = 0;
 int repelBufferDownsampling = 0; // --repel-downsample: interaction (repel) buffer resolution divisor
-int repel_width = 0;  // computed in buffer_setup, like density_width
+int repel_width = 0;             // computed in buffer_setup, like density_width
 int repel_height = 0;
 
 double dragCoefficient = 0;   // --drag: quadratic velocity damping coefficient
@@ -483,11 +483,20 @@ static dropt_error parse_duration(dropt_context *ctx, const dropt_option *opt, c
     double mult = 1.0;
     if (*end != '\0') {
         switch (*end) {
-        case 's': mult = 1.0; break;
-        case 'm': mult = 60.0; break;
-        case 'h': mult = 3600.0; break;
-        case 'd': mult = 86400.0; break;
-        default: return dropt_error_mismatch;
+        case 's':
+            mult = 1.0;
+            break;
+        case 'm':
+            mult = 60.0;
+            break;
+        case 'h':
+            mult = 3600.0;
+            break;
+        case 'd':
+            mult = 86400.0;
+            break;
+        default:
+            return dropt_error_mismatch;
         }
         if (end[1] != '\0') // only a single-char unit suffix is allowed
             return dropt_error_mismatch;
@@ -867,7 +876,7 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
          dropt_handle_bool, &corners_debug},
         {'\0', "profile", "Print per-pass GPU times in ms (forces glFinish, disables pipelining).", NULL,
          dropt_handle_bool, &prof},
-        // NOTE: macos-only -- samespace cover (Spaces, focus-steal) is meaningless on x11/wayland
+    // NOTE: macos-only -- samespace cover (Spaces, focus-steal) is meaningless on x11/wayland
 #ifdef RGFW_MACOS
         {'\0', "no-keyfocus-steal", "Show the window without stealing keyboard focus (for benchmarking).", NULL,
          dropt_handle_bool, &no_focus},
@@ -897,9 +906,9 @@ void parse_args(int argc, char **argv, bool wlwp, bool macwp) {
     size_t n_core = sizeof core_opts / sizeof core_opts[0];
     dropt_option *extra = macwp ? macwp_opts : wlwp ? wlwp_opts
                                                     : win_opts;
-    size_t n_extra = macwp ? sizeof macwp_opts / sizeof macwp_opts[0]
-                           : wlwp ? sizeof wlwp_opts / sizeof wlwp_opts[0]
-                                  : sizeof win_opts / sizeof win_opts[0];
+    size_t n_extra = macwp  ? sizeof macwp_opts / sizeof macwp_opts[0]
+                     : wlwp ? sizeof wlwp_opts / sizeof wlwp_opts[0]
+                            : sizeof win_opts / sizeof win_opts[0];
     dropt_option *options = malloc((n_core + n_extra + 1) * sizeof(dropt_option));
     if (!options) {
         fprintf(stderr, "goo: out of memory setting up option parser\n");

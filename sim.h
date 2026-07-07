@@ -15,10 +15,10 @@
 #include <stdio.h>
 
 // ---- render / sim geometry (set by the front-end via sim_set_dims) ----
-extern int width;          // internal render resolution (logical / render_scale)
-extern int height;         //
-extern int window_width;   // actual framebuffer size in device px (upscale target)
-extern int window_height;  //
+extern int width;         // internal render resolution (logical / render_scale)
+extern int height;        //
+extern int window_width;  // actual framebuffer size in device px (upscale target)
+extern int window_height; //
 // upscale source-crop: sim_present samples the render target over this uv sub-rect
 // instead of the full [0,0]..[1,1]. identity by default -> straight upscale; macwp
 // -m=-2 sets a centred crop per monitor so a shared field presents 1:1 (no stretch).
