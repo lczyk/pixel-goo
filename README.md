@@ -6,7 +6,23 @@ Work in progress, hence isn't actually doing the thing it's supposed to yet. The
 
 The idea is to make something similar to Sebastian Lague's [Ant and Slime Simulations](https://www.youtube.com/watch?v=X-iSQQgOd1A) - particles following one another's trails, but **without** looking at [the code](https://github.com/SebLague/Slime-Simulation).
 
-## Instructions
+## Install
+
+Via [Homebrew](https://brew.sh) (macOS and Linuxbrew):
+
+```bash
+brew install lczyk/pixel-goo/goo
+```
+
+This installs the `goo` binary (plus `goo-macwp`, the desktop-wallpaper variant, on macOS).
+
+If Homebrew refuses to load the tap with a trust error, it's the third-party tap gate (`HOMEBREW_REQUIRE_TAP_TRUST`). Trust it once and retry:
+
+```bash
+brew trust --tap lczyk/pixel-goo
+```
+
+## Build from source
 
 ```bash
 ./nob.c          # show usage (default target)
