@@ -169,6 +169,18 @@ double headroomPct = 0;         // --headroom-pct: track this density percentile
 float headroom_ema = 0.0f;      // running EMA of the density max (the auto headroom)
 float *density_readback = NULL; // CPU scratch for reading the density buffer back
 
+// Auto-headroom readback ring. The density field is read back to the CPU each headroom
+// update to find its percentile. A direct glReadPixels(FBO -> client) forces a full
+// CPU-GPU sync (the CPU blocks until the whole frame drains), a periodic multi-ms stall.
+// Instead the readback goes async into a ring of PBOs (glReadPixels FBO -> PBO returns
+// immediately), and we map the OLDEST slot -- filled DENS_PBO_N-1 updates ago, so its DMA
+// finished long ago and the map never stalls. Headroom is a slow EMA envelope follower, so
+// a few frames of readback latency is invisible.
+#define DENS_PBO_N 3
+GLuint dens_pbo[DENS_PBO_N] = {0};
+int dens_pbo_ring = 0;   // next ring slot to write
+int dens_pbo_primed = 0; // async reads issued so far (< DENS_PBO_N = still priming)
+
 // Buffer resolution divisor: the density field is render-res / this.
 int densityBufferDownsampling = 0;
 int density_width = 0; // computed in buffer_setup once width/height are final
@@ -1181,6 +1193,28 @@ void updateShaderBufferShape(int new_width, int new_height) {
 //
 //===================================================
 
+// (Re)size the headroom readback PBO ring to the current density-buffer dims and reset the
+// ring cursor. Same GL context (called from buffer_setup after a fresh gen, and from
+// sim_resize which keeps the context), so it only orphans + re-specs the existing buffers.
+static void dens_pbo_resize(void) {
+    size_t bytes = (size_t)density_width * density_height * sizeof(float);
+    for (int i = 0; i < DENS_PBO_N; i++) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, dens_pbo[i]);
+        glBufferData(GL_PIXEL_PACK_BUFFER, bytes, NULL, GL_STREAM_READ);
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    dens_pbo_ring = 0;
+    dens_pbo_primed = 0; // re-prime: the old ring contents are the wrong size / stale
+}
+
+// Generate the ring (fresh names) then size it. Called from buffer_setup, which runs once
+// per GL context -- on a context recreate (--gl-refresh) the old names died with the old
+// context, so gen unconditionally here, mirroring pbo_pos/pbo_vel below.
+static void dens_pbo_setup(void) {
+    glGenBuffers(DENS_PBO_N, dens_pbo);
+    dens_pbo_resize();
+}
+
 void buffer_setup(void) {
     fprintf(stdout, "Setting up buffers...\n");
 
@@ -1261,6 +1295,7 @@ void buffer_setup(void) {
     // Scratch for the auto-headroom: read the (tiny, downsampled) density buffer back to
     // find its max each density update. Sized generously so a resize can't overflow it.
     density_readback = (float *)malloc((size_t)(density_width + 8) * (density_height + 8) * sizeof(float));
+    dens_pbo_setup(); // async readback ring, sized to the density buffer just allocated
     // Seed 0 in auto mode so ema()'s seed-on-zero snaps to the FIRST measured level instead of
     // ramping from a guessed constant (that ramp showed as faint -> bright over the first ~1/attack frames).
     headroom_ema = (float)(renderHeadroom > 0.0 ? renderHeadroom : 0.0);
@@ -1477,6 +1512,7 @@ void sim_resize(int logical_w, int logical_h, int fb_w, int fb_h) {
     // floats into it, so a grow-resize overflows the setup-sized buffer (same class as
     // the sort_counts realloc below). Same generous +8 padding as buffer_setup.
     density_readback = (float *)realloc(density_readback, (size_t)(density_width + 8) * (density_height + 8) * sizeof(float));
+    dens_pbo_resize(); // keep the async readback ring sized to the (resized) density buffer
     // Repel buffer has its own resolution knob (--repel-downsample); recompute + realloc.
     repel_width = width / repelBufferDownsampling + 1;
     repel_height = height / repelBufferDownsampling + 1;
@@ -1637,22 +1673,55 @@ void sim_step(int epoch_counter, const float mouse_position[2], const float mous
         // percentile (robust to outlier hot-spots, unlike the raw max), and EMA it --
         // the envelope follower that sets the colormap's makeup gain.
         if (renderHeadroom <= 0.0) {
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[densityBuffer.current]);
-            glReadPixels(0, 0, density_width, density_height, GL_RED, GL_FLOAT, density_readback);
-            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
             int n = density_width * density_height;
-            qsort(density_readback, n, sizeof(float), cmp_float);
-            int k = (int)(headroomPct * (n - 1));
-            if (k < 0)
-                k = 0;
-            else if (k >= n)
-                k = n - 1;
-            float level = density_readback[k];
-            float target = level * (float)headroomMargin;
-            // Asymmetric follower: rising target (scene getting denser) closes fast to avoid
-            // clipping; falling target (opening up) brightens slowly so it doesn't pop.
-            double a = (headroom_ema > 0.0f && target < headroom_ema) ? headroomRelease : headroomAttack;
-            headroom_ema = (float)ema(headroom_ema, target, a);
+            // Async DMA of the fresh density into this ring slot -- glReadPixels into a bound
+            // GL_PIXEL_PACK_BUFFER is a GPU-side copy that returns immediately (no CPU sync).
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[densityBuffer.current]);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, dens_pbo[dens_pbo_ring]);
+            glReadPixels(0, 0, density_width, density_height, GL_RED, GL_FLOAT, 0);
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+            bool have = false;
+            if (dens_pbo_primed >= DENS_PBO_N) {
+                // Steady state: map the OLDEST slot (written DENS_PBO_N-1 updates ago -> its DMA
+                // is long done -> the map does not stall), copy it into the sort scratch, unmap.
+                int oldest = (dens_pbo_ring + 1) % DENS_PBO_N;
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, dens_pbo[oldest]);
+                void *p = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (size_t)n * sizeof(float), GL_MAP_READ_BIT);
+                if (p) {
+                    memcpy(density_readback, p, (size_t)n * sizeof(float));
+                    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+                    have = true;
+                }
+                glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+            } else {
+                // Startup priming: the ring isn't full yet. One synchronous read of the current
+                // density so the exposure EMA tracks from the first frames (a few stalls during
+                // the warmup ramp), then the async path above takes over -- no startup flash.
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffers[densityBuffer.current]);
+                glReadPixels(0, 0, density_width, density_height, GL_RED, GL_FLOAT, density_readback);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+                have = true;
+            }
+            dens_pbo_ring = (dens_pbo_ring + 1) % DENS_PBO_N;
+            if (dens_pbo_primed < DENS_PBO_N)
+                dens_pbo_primed++;
+
+            if (have) {
+                qsort(density_readback, n, sizeof(float), cmp_float);
+                int k = (int)(headroomPct * (n - 1));
+                if (k < 0)
+                    k = 0;
+                else if (k >= n)
+                    k = n - 1;
+                float level = density_readback[k];
+                float target = level * (float)headroomMargin;
+                // Asymmetric follower: rising target (scene getting denser) closes fast to avoid
+                // clipping; falling target (opening up) brightens slowly so it doesn't pop.
+                double a = (headroom_ema > 0.0f && target < headroom_ema) ? headroomRelease : headroomAttack;
+                headroom_ema = (float)ema(headroom_ema, target, a);
+            }
         }
     }
     LAP(2);
