@@ -89,3 +89,43 @@ jobs:
           case "${{ github.ref_name }}" in *-*) prerelease=--prerelease ;; esac
           gh release create "${{ github.ref_name }}" dist/* \
             --generate-notes $prerelease
+
+  # push the new version to the homebrew tap so `brew upgrade goo` picks it up.
+  # build-from-source formula, so the bump is just the archive url tag + its sha256.
+  bump-tap:
+    needs: release
+    runs-on: ubuntu-latest
+    # stable tags only -- prereleases (v1.2.3-rc1) don't touch the stable formula.
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      # TAP_PUSH_TOKEN: lczyk-bot PAT/app token with contents:write on the tap repo.
+      - uses: actions/checkout@v5
+        with:
+          repository: lczyk/homebrew-pixel-goo
+          token: ${{ secrets.TAP_PUSH_TOKEN }}
+
+      - name: bump formula
+        env:
+          TAG: ${{ github.ref_name }}
+          SRC_REPO: lczyk/pixel-goo
+        run: |
+          url="https://github.com/${SRC_REPO}/archive/refs/tags/${TAG}.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          echo "tag=${TAG} sha=${sha}"
+          sed -i -E \
+            -e "s|(/archive/refs/tags/)v[0-9]+\.[0-9]+\.[0-9]+(\.tar\.gz)|\1${TAG}\2|" \
+            -e "s|(sha256 \")[0-9a-f]{64}(\")|\1${sha}\2|" \
+            Formula/goo.rb
+
+      - name: commit and push
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if git diff --quiet; then
+            echo "formula already at ${TAG}, nothing to do"
+            exit 0
+          fi
+          git config user.name lczyk-bot
+          git config user.email lczyk-bot@users.noreply.github.com
+          git commit -am "goo ${TAG#v}"
+          git push
