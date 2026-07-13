@@ -1,5 +1,8 @@
 # pixel-goo
 
+[![version](https://img.shields.io/github/v/release/lczyk/pixel-goo?label=version&color=blue)](https://github.com/lczyk/pixel-goo/releases)
+[![homebrew tap](https://img.shields.io/github/v/release/lczyk/pixel-goo?label=homebrew%20tap&color=orange)](https://github.com/lczyk/homebrew-pixel-goo)
+
 Goo-like particle system simulation running on the GPU.
 
 Work in progress, hence isn't actually doing the thing it's supposed to yet. The GPU computing works though and it compiles fine (at least on a Mac).
